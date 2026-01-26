@@ -1,119 +1,121 @@
 ---
 name: george
-description: Banking automation for George (Erste Bank/Sparkasse Austria) using Playwright. Use for login/session, listing accounts, balances, and downloading statements/transactions.
-version: 1.0.0
-metadata: {"clawdbot":{"requires":{"bins":["python3","playwright"]}}}
+description: Automate George online banking (Erste Bank / Sparkasse Austria) using Playwright: login/session (phone approval), list accounts + balances, and download statements/exports/transactions (CAMT53, MT940, CSV/JSON/OFX/XLSX). Use when the user mentions George, Erste/Sparkasse, account statements, CAMT53/MT940, or transaction exports.
+version: 1.0.4
+homepage: https://george.sparkasse.at/
+metadata: {"clawdbot":{"emoji":"🏦","requires":{"bins":["python3","playwright"]}}}
 ---
 
-# George Banking Automation Skill
+# George Banking Automation
 
-Modular automation for George (Erste Bank/Sparkasse Austria).
+Modular automation for **George (Erste Bank / Sparkasse Austria)**.
+
+**Entry point:** `{baseDir}/scripts/george.py`
 
 ## Setup
 
-**Quick setup (recommended):**
+### Quick setup (recommended)
+
 ```bash
-cd ./scripts
-./george.py setup
+python3 {baseDir}/scripts/george.py setup
 
-# This will:
-# - Prompt for your George user ID
-# - Save config to ~/.clawdbot/george/config.json
-# - Check/install playwright
-# - Install chromium browser
-
-# Then discover your accounts:
-./george.py accounts --fetch
+# First account sync (auto-fetches if config has none):
+python3 {baseDir}/scripts/george.py accounts
 ```
 
-**Manual setup (alternative):**
+What `setup` does:
+- Prompts for your **George user number / username** (`user_id`)
+- Writes `~/.clawdbot/george/config.json` (accounts stored as an array)
+- Ensures Playwright is installed and installs Chromium
+
+### Manual setup (alternative)
+
 ```bash
-# Install playwright
 pipx install playwright
 playwright install chromium
 
-# Create config manually at ~/.clawdbot/george/config.json
 mkdir -p ~/.clawdbot/george
 cat > ~/.clawdbot/george/config.json <<EOF
 {
-    "user_id": "YOUR_USER_ID",
-    "accounts": {}
+  "user_id": "YOUR_USER_ID",
+  "accounts": {}
 }
 EOF
 
-# Discover accounts
-./scripts/george.py accounts --fetch
+python3 {baseDir}/scripts/george.py accounts
 ```
 
 ## Commands
 
-### Session Management
+### Session management
 
 ```bash
-# Login (opens browser, waits for phone approval)
-./scripts/george.py login
-
-# Logout (clears session profile)
-./scripts/george.py logout
+python3 {baseDir}/scripts/george.py login
+python3 {baseDir}/scripts/george.py logout
 ```
 
-*Note: Session is persisted in `~/.clawdbot/george/.pw-profile/` (or `--dir`).*
+Session is persisted in `~/.clawdbot/george/.pw-profile/` (or `--dir`).
 
-### List Accounts
+### Accounts
 
 ```bash
-# List accounts from config.json
-./scripts/george.py accounts
-
-# Fetch live from George (requires login)
-./scripts/george.py accounts --fetch
+python3 {baseDir}/scripts/george.py accounts          # list from config; if empty, fetch + save into config.json
+python3 {baseDir}/scripts/george.py accounts --fetch  # refresh from George and update config.json
 ```
 
-### Check Balances
+### Balances
 
 ```bash
-./scripts/george.py balances
+python3 {baseDir}/scripts/george.py balances
 ```
 
-### Download Data
+### Statements (PDF)
 
-**PDF Statements (quarterly, per account):**
 ```bash
-./scripts/george.py statements -a main -y 2025 -q 4
+python3 {baseDir}/scripts/george.py statements -a main -y 2025 -q 4
 ```
 
-**Data exports (for bookkeeping; all accounts):**
+Note: currently only the **Q4 statement ID mapping** is validated.
+
+### Data exports (bookkeeping)
+
 ```bash
-./scripts/george.py export              # CAMT53 (default)
-./scripts/george.py export --type mt940
+python3 {baseDir}/scripts/george.py export              # CAMT53 (default)
+python3 {baseDir}/scripts/george.py export --type mt940
 ```
 
-**Transactions (CSV/JSON/OFX/XLSX):**
+### Transactions
+
 ```bash
-# Default format (CSV) for today:
-./scripts/george.py transactions -a main
+python3 {baseDir}/scripts/george.py transactions -a main                  # CSV (default)
+python3 {baseDir}/scripts/george.py transactions -a main -f json
+python3 {baseDir}/scripts/george.py transactions -a main -f ofx
+python3 {baseDir}/scripts/george.py transactions -a main -f xlsx
 
-# Specific formats:
-./scripts/george.py transactions -a main -f json
-./scripts/george.py transactions -a main -f ofx
-./scripts/george.py transactions -a main -f xlsx
-
-# With date range:
-./scripts/george.py transactions -a main -f csv --from 01.01.2025 --to 31.01.2025
+python3 {baseDir}/scripts/george.py transactions -a main --from 01.01.2025 --to 31.01.2025
 ```
 
 Supported formats: `csv` (default), `json`, `ofx`, `xlsx`
 
-## Global Options
+## Global options
 
 ```
---visible          Show browser window (for debugging)
+--visible          Show browser window (debugging)
 --dir DIR          State directory (default: ~/.clawdbot/george; override via GEORGE_DIR)
 --login-timeout N  Seconds to wait for phone approval (default: 60)
+--user-id ID       Override user number/username (or set GEORGE_USER_ID)
 ```
 
-## Output Locations
+You can also put `GEORGE_USER_ID=...` in `~/.clawdbot/george/.env`.
 
-- **Data:** `~/.clawdbot/george/data/YYYY-QX/` (or `--dir`)
+## Output / state locations
+
 - **Config:** `~/.clawdbot/george/config.json` (or `--dir`)
 - **Session:** `~/.clawdbot/george/.pw-profile/` (or `--dir`)
+- **Downloads:** `~/.clawdbot/george/data/` (or `--dir`)
+
+## Security notes
+
+- This skill downloads **banking documents and transaction exports** to disk. Treat the state dir as sensitive.
+- Login requires **phone approval** in the George app; credentials are **not** stored in the skill folder.
+- Never log OAuth tokens (George sometimes returns tokens in URL fragments).
