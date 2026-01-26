@@ -1,7 +1,7 @@
 ---
 name: george
 description: Automate George online banking (Erste Bank / Sparkasse Austria) using Playwright: login/session (phone approval), list accounts + balances, and download statements/exports/transactions (CAMT53, MT940, CSV/JSON/OFX/XLSX). Use when the user mentions George, Erste/Sparkasse, account statements, CAMT53/MT940, or transaction exports.
-version: 1.0.4
+version: 1.0.5
 homepage: https://george.sparkasse.at/
 metadata: {"clawdbot":{"emoji":"🏦","requires":{"bins":["python3","playwright"]}}}
 ---
