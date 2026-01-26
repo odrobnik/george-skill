@@ -3,6 +3,8 @@
 __pycache__/
 *.pyc
 .env
+# GitHub-only docs
+README.md
 # Local secrets
 tokens-*.json
 secrets/
