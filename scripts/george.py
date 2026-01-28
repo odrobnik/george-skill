@@ -65,6 +65,9 @@ CONFIG_PATH: Path = STATE_DIR / "config.json"
 PROFILE_DIR: Path = STATE_DIR / ".pw-profile"
 DEFAULT_OUTPUT_DIR: Path = STATE_DIR / "data"
 
+DEBUG_DIR: Path = STATE_DIR / "debug"
+TOKEN_CACHE_FILE: Path = PROFILE_DIR / "token.json"
+
 DEFAULT_LOGIN_TIMEOUT = 60  # seconds
 
 # User id override for this run (set from CLI --user-id)
@@ -156,8 +159,140 @@ def _apply_state_dir(dir_value: str | None) -> None:
     PROFILE_DIR = STATE_DIR / ".pw-profile"
     DEFAULT_OUTPUT_DIR = STATE_DIR / "data"
 
+    global DEBUG_DIR, TOKEN_CACHE_FILE
+    DEBUG_DIR = STATE_DIR / "debug"
+    TOKEN_CACHE_FILE = PROFILE_DIR / "token.json"
+
     # Load optional .env from the state dir.
     _load_dotenv(STATE_DIR / ".env")
+
+
+
+def _now_iso_local() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+
+def _write_debug_json(prefix: str, payload) -> Path:
+    # Write bank-native payload to a timestamped JSON file for debugging.
+    _ensure_dir(DEBUG_DIR)
+    ts = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+    out = DEBUG_DIR / f"{ts}-{prefix}.json"
+    out.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+    return out
+
+
+def _load_token_cache() -> dict | None:
+    try:
+        if not TOKEN_CACHE_FILE.exists():
+            return None
+        return json.loads(TOKEN_CACHE_FILE.read_text())
+    except Exception:
+        return None
+
+
+def _save_token_cache(access_token: str, source: str = "auth_header", expires_at: str | None = None) -> None:
+    try:
+        _ensure_dir(TOKEN_CACHE_FILE.parent)
+        data = {
+            "accessToken": access_token,
+            "obtainedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "expiresAt": expires_at,
+            "source": source,
+        }
+        TOKEN_CACHE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+    except Exception:
+        return
+
+
+def _extract_bearer_token(auth_header: str) -> str | None:
+    if not auth_header:
+        return None
+    m = re.match(r"(?i)bearer\s+(.+)$", auth_header.strip())
+    if not m:
+        return None
+    return m.group(1).strip()
+
+
+def _eu_amount(amount: float | None) -> str:
+    if amount is None:
+        return "N/A"
+    s = f"{amount:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    return s
+
+
+def _canonical_account_type_george(raw_type: str | None) -> str:
+    t = (raw_type or "").lower()
+    return {
+        "currentaccount": "checking",
+        "saving": "savings",
+        "loan": "loan",
+        "credit": "credit",
+        "kredit": "credit",
+        "creditcard": "creditcard",
+    }.get(t, t or "other")
+
+
+def canonicalize_accounts_george(payload, normalized: list[dict], raw_path: Path | None = None) -> dict:
+    # Build canonical accounts wrapper for George.
+    raw_accounts: list[dict] = []
+    if isinstance(payload, list):
+        raw_accounts = [x for x in payload if isinstance(x, dict)]
+    elif isinstance(payload, dict):
+        for key in ("items", "accounts", "data", "content", "accountList"):
+            v = payload.get(key)
+            if isinstance(v, list):
+                raw_accounts = [x for x in v if isinstance(x, dict)]
+                break
+
+    by_id: dict[str, dict] = {}
+    for acc in raw_accounts:
+        acc_id = _extract_first(acc, ["id", "accountId", "uid", "uuid"])
+        if acc_id is not None:
+            by_id[str(acc_id)] = acc
+
+    out_accounts = []
+    for a in normalized:
+        acc_id = str(a.get("id") or "")
+        raw = by_id.get(acc_id) or {}
+
+        bal_amt, bal_ccy = _extract_money_from_account(
+            raw,
+            ["balance", "accountBalance", "amount", "currentBalance", "value"],
+            ["currency", "ccy"],
+        )
+        avail_amt, avail_ccy = _extract_money_from_account(
+            raw,
+            ["disposable", "disposableAmount", "available", "availableAmount", "disposableBalance"],
+            ["currency", "ccy"],
+        )
+        if avail_ccy is None:
+            avail_ccy = bal_ccy
+
+        currency = (a.get("currency") or bal_ccy or avail_ccy or "EUR").strip()
+
+        acct = {
+            "id": acc_id,
+            "type": _canonical_account_type_george(a.get("type")),
+            "name": a.get("name") or a.get("alias") or a.get("description") or "N/A",
+            "iban": a.get("iban"),
+            "currency": currency,
+            "balances": {
+                "booked": {"amount": bal_amt, "currency": currency} if bal_amt is not None else None,
+                "available": {"amount": avail_amt, "currency": currency} if avail_amt is not None else None,
+            },
+        }
+        out_accounts.append(acct)
+
+    return {
+        "institution": "george",
+        "fetchedAt": _now_iso_local(),
+        "rawPath": str(raw_path) if raw_path else None,
+        "accounts": out_accounts,
+    }
 
 def _login_timeout(args) -> int:
     return getattr(args, "login_timeout", DEFAULT_LOGIN_TIMEOUT)
@@ -597,6 +732,15 @@ def _format_iban(iban: str) -> str:
     return " ".join(clean[i : i + 4] for i in range(0, len(clean), 4))
 
 
+def _short_iban(iban: str | None) -> str:
+    if not iban:
+        return "IBAN N/A"
+    clean = re.sub(r"\s+", "", iban).strip()
+    if len(clean) <= 8:
+        return clean
+    return f"{clean[:4]}...{clean[-4:]}"
+
+
 def _first_iban_in_text(text: str) -> str | None:
     # Standard Austrian IBAN is 20 chars: AT + 18 digits.
     # Note: don't use a word-boundary here; George sometimes concatenates strings like "...KGAT31...".
@@ -610,6 +754,191 @@ def _first_iban_in_text(text: str) -> str | None:
         return _format_iban(m2.group(0))
 
     return None
+
+
+def capture_bearer_auth_header(context, page, timeout_s: int = 10) -> str | None:
+    """Capture Bearer Authorization header from any George API request.
+
+    Note: we listen on the *browser context* (not only the page) because George may
+    issue requests from background frames / service worker-like contexts.
+    """
+    auth_header = {"value": None}
+
+    def _on_request(request) -> None:
+        if auth_header["value"]:
+            return
+        try:
+            url = request.url or ""
+            if not url.startswith("https://api.sparkasse.at/rest/netbanking/"):
+                return
+            headers = request.headers or {}
+            auth = headers.get("authorization") or headers.get("Authorization")
+            if auth and auth.lower().startswith("bearer "):
+                auth_header["value"] = auth
+        except Exception:
+            return
+
+    context.on("request", _on_request)
+    try:
+        # Force a fresh app bootstrap to trigger API calls.
+        try:
+            page.goto("about:blank")
+        except Exception:
+            pass
+
+        # Add a cache-buster (before #) to reduce SW/cache short-circuiting.
+        bust_url = f"https://george.sparkasse.at/index.html?nocache={int(time.time())}#/overview"
+        page.goto(bust_url, wait_until="networkidle")
+
+        start = time.time()
+        reloaded = False
+        while time.time() - start < timeout_s:
+            if auth_header["value"]:
+                return auth_header["value"]
+
+            # One best-effort reload mid-way to coax the SPA into firing requests.
+            if not reloaded and (time.time() - start) > max(1.0, timeout_s / 3):
+                reloaded = True
+                try:
+                    page.reload(wait_until="networkidle")
+                except Exception:
+                    pass
+
+            time.sleep(0.2)
+    finally:
+        try:
+            context.off("request", _on_request)
+        except Exception:
+            pass
+
+    return auth_header["value"]
+
+
+def fetch_my_accounts(context, auth_header: str) -> dict:
+    url = "https://api.sparkasse.at/rest/netbanking/my/accounts"
+    try:
+        resp = context.request.get(url, headers={"Authorization": auth_header}, timeout=30000)
+    except Exception as e:
+        raise RuntimeError(f"[accounts] API request failed: {e}") from e
+
+    if not resp or not resp.ok:
+        status = resp.status if resp else "N/A"
+        raise RuntimeError(f"[accounts] API request failed (status={status})")
+
+    return resp.json()
+
+
+def _extract_first(d: dict, keys: list[str]) -> object | None:
+    for k in keys:
+        if k in d and d.get(k) is not None:
+            return d.get(k)
+    return None
+
+
+def _extract_amount(value) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        s = value.strip().replace(".", "").replace(",", ".")
+        try:
+            return float(s)
+        except Exception:
+            return None
+    if isinstance(value, dict):
+        # Common George money object: { value: 18245, precision: 2, currency: 'EUR' }
+        if "value" in value and isinstance(value.get("value"), (int, float)):
+            prec = value.get("precision")
+            if isinstance(prec, int) and prec >= 0:
+                return float(value.get("value")) / (10 ** prec)
+
+        for k in ("value", "amount", "balance", "disposable", "available"):
+            if k in value:
+                out = _extract_amount(value.get(k))
+                if out is not None:
+                    return out
+        for k in ("valueInCents", "amountInCents", "cents", "amountCents", "valueCents"):
+            if k in value and isinstance(value.get(k), (int, float)):
+                return float(value.get(k)) / 100.0
+    return None
+
+
+def _extract_currency(value) -> str | None:
+    if isinstance(value, dict):
+        for k in ("currency", "ccy"):
+            v = value.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    return None
+
+
+def normalize_accounts_from_api(payload) -> list[dict]:
+    if payload is None:
+        return []
+
+    accounts = None
+    if isinstance(payload, list):
+        accounts = payload
+    elif isinstance(payload, dict):
+        for key in ("items", "accounts", "data", "content", "accountList"):
+            v = payload.get(key)
+            if isinstance(v, list):
+                accounts = v
+                break
+        else:
+            accounts = [payload]
+    else:
+        return []
+
+    normalized: list[dict] = []
+    for acc in accounts:
+        if not isinstance(acc, dict):
+            continue
+        acc_id = _extract_first(acc, ["id", "accountId", "uid", "uuid"])
+        acc_type = _extract_first(acc, ["type", "accountType", "productType", "accountCategory"])
+        name = _extract_first(acc, ["name", "alias", "productName", "description", "accountLabel", "accountName"])
+        iban = _extract_first(acc, ["iban", "ibanNumber", "ibanFormatted"])
+        currency = _extract_first(acc, ["currency", "ccy"])
+
+        # George /my/accounts shape nests IBAN in accountno.iban
+        if iban is None:
+            accountno = acc.get("accountno") or acc.get("accountNo") or acc.get("accountNumber")
+            if isinstance(accountno, dict):
+                iban = accountno.get("iban") or accountno.get("IBAN")
+
+        if isinstance(iban, dict):
+            iban = _extract_first(iban, ["iban", "ibanNumber", "value"])
+
+        entry = {
+            "id": str(acc_id) if acc_id is not None else "",
+            "type": (str(acc_type) if acc_type is not None else "").lower(),
+            "name": str(name) if name is not None else "",
+            "iban": str(iban) if iban is not None else None,
+        }
+
+        if currency:
+            entry["currency"] = str(currency)
+
+        desc = _extract_first(acc, ["description"])
+        alias = _extract_first(acc, ["alias"])
+        if desc:
+            entry["description"] = str(desc)
+        if alias:
+            entry["alias"] = str(alias)
+
+        normalized.append(entry)
+
+    return normalized
+
+
+def _extract_money_from_account(acc: dict, value_keys: list[str], currency_keys: list[str]) -> tuple[float | None, str | None]:
+    raw = _extract_first(acc, value_keys)
+    amount = _extract_amount(raw)
+    currency = _extract_currency(raw) or _extract_first(acc, currency_keys)
+    if isinstance(currency, str):
+        currency = currency.strip()
+    return amount, currency
 
 
 def try_extract_iban_from_account_page(page, acc_type: str, acc_id: str) -> str | None:
@@ -978,6 +1307,11 @@ EXPORT_TYPE_LABELS = {
     "mt940": "MT940",
 }
 
+DATACARRIER_UPLOAD_URL = "https://george.sparkasse.at/index.html#/datacarrier/upload"
+DATACARRIER_SIGN_URL_TEMPLATE = "https://george.sparkasse.at/index.html#/datacarrier/upload/sign/{datacarrier_id}?returnUrl=%2Fdatacarrier%2Fupload"
+DATACARRIER_SIGN_API_TEMPLATE = "https://api.sparkasse.at/rest/netbanking/my/orders/datacarriers/{datacarrier_id}/sign/"
+DATACARRIER_FILES_API_URL = "https://api.sparkasse.at/rest/netbanking/my/orders/datacarrier-files"
+
 
 def download_data_exports(page, export_type: str, download_dir: Path = None) -> list[Path]:
     """Download data exports (CAMT53/MT940) for all available accounts."""
@@ -1017,6 +1351,190 @@ def download_data_exports(page, export_type: str, download_dir: Path = None) -> 
             print(f"[export] Download failed: {e}", flush=True)
 
     return downloaded
+
+
+def _click_first_visible_button(page, selectors: list[str]) -> bool:
+    for selector in selectors:
+        try:
+            btn = page.query_selector(selector)
+            if btn and btn.is_visible():
+                btn.click()
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _try_select_datacarrier_type(page, file_type: str) -> None:
+    if not file_type:
+        return
+
+    # Try native <select> first
+    try:
+        select_el = page.locator("select")
+        if select_el.count() > 0:
+            select_el.first.select_option(label=file_type)
+            time.sleep(0.5)
+            return
+    except Exception:
+        pass
+
+    # Try combobox/option roles
+    try:
+        combo = page.get_by_role("combobox").first
+        if combo and combo.is_visible():
+            combo.click()
+            time.sleep(0.3)
+            option = page.get_by_role("option", name=re.compile(re.escape(file_type), re.I))
+            if option.count() > 0:
+                option.first.click()
+                time.sleep(0.3)
+                return
+    except Exception:
+        pass
+
+    # Fallback: clickable labels/buttons with the type text
+    try:
+        btn = page.locator(f'button:has-text("{file_type}")')
+        if btn.count() > 0 and btn.first.is_visible():
+            btn.first.click()
+            time.sleep(0.3)
+            return
+    except Exception:
+        pass
+
+
+def upload_datacarrier_file(page, file_path: Path, file_type: str | None = None) -> dict | None:
+    print(f"[datacarrier-upload] Opening upload page...", flush=True)
+    page.goto(DATACARRIER_UPLOAD_URL, wait_until="domcontentloaded")
+    time.sleep(2)
+    dismiss_modals(page)
+
+    if file_type:
+        print(f"[datacarrier-upload] Selecting type: {file_type}", flush=True)
+        _try_select_datacarrier_type(page, file_type)
+
+    def _is_datacarrier_response(resp) -> bool:
+        try:
+            return resp.request.method == "POST" and "/datacarrier-files" in (resp.url or "")
+        except Exception:
+            return False
+
+    upload_buttons = [
+        'button:has-text("Upload")',
+        'button:has-text("Send")',
+        'button:has-text("Submit")',
+        'button:has-text("Import")',
+        'button:has-text("Start")',
+        'button:has-text("Weiter")',
+        'button:has-text("Senden")',
+        'button[type="submit"]',
+    ]
+
+    # Find the file input
+    try:
+        file_input = page.locator('input[type="file"]')
+        file_input.wait_for(timeout=30000)
+    except Exception as e:
+        print(f"[datacarrier-upload] ERROR: Could not find file input: {e}", flush=True)
+        return None
+
+    response = None
+    try:
+        with page.expect_response(_is_datacarrier_response, timeout=120000) as resp_info:
+            file_input.set_input_files(str(file_path))
+            clicked = _click_first_visible_button(page, upload_buttons)
+            if not clicked:
+                # Some UIs auto-upload after file selection
+                pass
+        response = resp_info.value
+    except PlaywrightTimeout:
+        print("[datacarrier-upload] ERROR: Timed out waiting for upload response", flush=True)
+        return None
+
+    try:
+        return response.json()
+    except Exception:
+        try:
+            text = response.text()
+            return {"raw": text}
+        except Exception:
+            return {"raw": "<unparseable response>"}
+
+
+def _extract_sign_state(payload: dict | None) -> tuple[str | None, str | None]:
+    if not isinstance(payload, dict):
+        return None, None
+    sign_id = payload.get("signId") or payload.get("id")
+    sign_info = payload.get("signInfo")
+    state = None
+    if isinstance(sign_info, dict):
+        state = sign_info.get("state")
+    return sign_id, state
+
+
+def _extract_sign_id_from_url(url: str | None) -> str | None:
+    if not url:
+        return None
+    try:
+        path = urlsplit(url).path or ""
+        parts = [p for p in path.split("/") if p]
+        if not parts:
+            return None
+        # .../datacarriers/<id>/sign/<signId>
+        if parts[-1] and parts[-1].lower() != "sign":
+            return parts[-1]
+    except Exception:
+        return None
+    return None
+
+
+def _build_datacarrier_files_list_url() -> str:
+    return f"{DATACARRIER_FILES_API_URL}?page=0&size=100"
+
+
+def _extract_datacarrier_file_state(payload, file_id: str | int | None) -> tuple[str | None, dict | None]:
+    if file_id is None:
+        return None, None
+
+    items = []
+    if isinstance(payload, list):
+        items = payload
+    elif isinstance(payload, dict):
+        for key in ("items", "data", "datacarrierFiles", "files", "content"):
+            v = payload.get(key)
+            if isinstance(v, list):
+                items = v
+                break
+        else:
+            items = [payload]
+
+    file_id_s = str(file_id)
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_id = item.get("id") or item.get("fileId") or item.get("uuid")
+        if item_id is not None and str(item_id) == file_id_s:
+            state = item.get("state") or item.get("status")
+            return state, item
+    return None, None
+
+
+def _click_confirmation_button(page) -> bool:
+    try:
+        locator = page.get_by_role("button", name=re.compile(r"(sign|confirm|weiter|best.?tigen)", re.I))
+        count = locator.count()
+        for idx in range(count):
+            btn = locator.nth(idx)
+            try:
+                if btn.is_visible():
+                    btn.click()
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        return False
+    return False
 
 
 def _parse_ddmmyyyy(s: str) -> date:
@@ -1316,28 +1834,23 @@ def cmd_setup(args):
 
 
 def cmd_accounts(args):
-    """List available accounts."""
+    """List accounts (with balances/value) in a unified format."""
     global CONFIG
     if CONFIG is None:
         CONFIG = load_config()
 
-    print("\n=== Known Accounts (from config) ===\n")
-    accounts: list[dict] = CONFIG.get("accounts", []) or []
+    cached_accounts: list[dict] = CONFIG.get("accounts", []) or []
 
-    for acc in accounts:
-        iban = acc.get("iban") or "N/A"
-        acc_id = acc.get("id") or "N/A"
-        typ = acc.get("type") or "N/A"
-        name = acc.get("name") or "N/A"
-        print(f"  {typ:12} {name:28} {iban:24} id={acc_id}")
+    do_fetch = not bool(getattr(args, "no_fetch", False))
+    if bool(getattr(args, "fetch", False)):
+        do_fetch = True
 
-    # Auto-fetch if config has no accounts. Explicit --fetch always refreshes.
-    do_fetch = bool(args.fetch) or len(accounts) == 0
+    raw_payload = None
+    raw_path = None
+    normalized: list[dict] = []
 
     if do_fetch:
-        if not accounts:
-            print("\n[accounts] No accounts in config.json; fetching from George...", flush=True)
-
+        print("[accounts] Fetching live accounts via George API...", flush=True)
         with sync_playwright() as p:
             context = p.chromium.launch_persistent_context(
                 user_data_dir=str(PROFILE_DIR),
@@ -1347,37 +1860,86 @@ def cmd_accounts(args):
             page = context.new_page()
 
             try:
-                if login(page, timeout_seconds=_login_timeout(args)):
-                    dismiss_modals(page)
-                    fetched = list_accounts_from_page(page)
+                if not login(page, timeout_seconds=_login_timeout(args)):
+                    return 1
 
-                    # Fill missing IBANs by visiting the account pages (best-effort).
-                    for acc in fetched:
-                        if acc.get("iban"):
-                            continue
-                        if (acc.get("type") or "").lower() == "creditcard":
-                            continue
-                        iban = try_extract_iban_from_account_page(page, acc.get("type") or "", acc.get("id") or "")
-                        if iban:
-                            acc["iban"] = iban
+                dismiss_modals(page)
 
-                    print("\n=== Accounts from George ===\n")
-                    for acc in fetched:
-                        iban = acc.get("iban") or "N/A"
-                        print(f"  {acc['type']:15} {acc['name']:25} {iban}")
-                        print(f"    ID: {acc['id']}")
+                # Try cached token first to avoid re-capturing headers.
+                token_cache = _load_token_cache() or {}
+                token = token_cache.get("accessToken") if isinstance(token_cache, dict) else None
+                if isinstance(token, str) and token.strip():
+                    try:
+                        raw_payload = fetch_my_accounts(context, f"Bearer {token.strip()}")
+                    except Exception:
+                        raw_payload = None
 
-                    updated, changed = merge_accounts_into_config(CONFIG, fetched)
-                    if changed:
-                        CONFIG = updated
-                        save_config(CONFIG)
-                        print("\n[accounts] Updated config.json (ids):")
-                        for cid in changed:
-                            print(f"  - {cid}")
+                if raw_payload is None:
+                    auth_header = capture_bearer_auth_header(context, page, timeout_s=10)
+                    if not auth_header:
+                        print("[accounts] ERROR: Could not capture API Authorization header", flush=True)
+                        return 1
+
+                    raw_payload = fetch_my_accounts(context, auth_header)
+                    tok = _extract_bearer_token(auth_header)
+                    if tok:
+                        _save_token_cache(tok, source="auth_header")
+
+                raw_path = _write_debug_json("my-accounts-raw", raw_payload)
+
+                normalized = normalize_accounts_from_api(raw_payload)
+
+                # Persist identity-only account list in config (stable mapping for later commands)
+                CONFIG["accounts"] = normalized
+                save_config(CONFIG)
+
             finally:
                 context.close()
 
+    else:
+        normalized = cached_accounts
+
+    if not normalized:
+        if getattr(args, "json", False):
+            print(json.dumps({"institution": "george", "fetchedAt": _now_iso_local(), "rawPath": None, "accounts": []}, indent=2))
+        else:
+            print("[accounts] No accounts found", flush=True)
+        return 0
+
+    wrapper = canonicalize_accounts_george(raw_payload, normalized, raw_path=raw_path)
+
+    if getattr(args, "json", False):
+        print(json.dumps(wrapper, ensure_ascii=False, indent=2))
+        return 0
+
+    print(f"[accounts] {len(wrapper['accounts'])} account(s):", flush=True)
+    for acc in wrapper["accounts"]:
+        name = acc.get("name") or "N/A"
+        iban_short = _short_iban(acc.get("iban"))
+        typ = acc.get("type") or "other"
+
+        balances = acc.get("balances") if isinstance(acc.get("balances"), dict) else {}
+        booked = balances.get("booked") if isinstance(balances, dict) else None
+        available = balances.get("available") if isinstance(balances, dict) else None
+
+        booked_s = "N/A"
+        avail_s = None
+        cur = acc.get("currency") or "EUR"
+        if isinstance(booked, dict) and booked.get("amount") is not None:
+            booked_s = f"{_eu_amount(float(booked['amount']))} {cur}"
+        if isinstance(available, dict) and available.get("amount") is not None:
+            avail_s = f"{_eu_amount(float(available['amount']))} {cur}"
+
+        if avail_s and avail_s != booked_s:
+            print(f"- {name} — {iban_short} — {booked_s} (avail {avail_s}) — {typ}", flush=True)
+        else:
+            print(f"- {name} — {iban_short} — {booked_s} — {typ}", flush=True)
+
+    if wrapper.get("rawPath"):
+        print(f"[accounts] raw payload saved: {wrapper['rawPath']}", flush=True)
+
     return 0
+
 
 
 def cmd_balances(args):
@@ -1395,24 +1957,57 @@ def cmd_balances(args):
                 return 1
 
             dismiss_modals(page)
-            rows = list_account_balances_from_overview(page)
+            auth_header = capture_bearer_auth_header(context, page, timeout_s=10)
+            if not auth_header:
+                print("[balances] ERROR: Could not capture API Authorization header", flush=True)
+                return 1
 
-            # Print in a parseable format
+            payload = fetch_my_accounts(context, auth_header)
+            accounts = normalize_accounts_from_api(payload)
+
             def fmt(amount: float | None, cur: str | None) -> str:
-                if amount is None or not cur:
+                if amount is None:
                     return "N/A"
-                # 1234.56 -> 1.234,56
+                cur = (cur or "EUR").strip()
                 s = f"{amount:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
                 return f"{s} {cur}"
 
-            print("\n=== Balances (George overview) ===\n")
-            for r in rows:
-                bal_str = fmt(r.get("balance"), r.get("currency"))
-                avail_str = fmt(r.get("available"), r.get("available_currency") or r.get("currency"))
-                if r.get("available") is not None:
-                    print(f"- {r['name']}: {bal_str} (available: {avail_str})")
-                else:
-                    print(f"- {r['name']}: {bal_str}")
+            # Try to enrich with balance/disposable fields from raw payload if present.
+            # We iterate over raw accounts to preserve any balance data.
+            raw_accounts = None
+            if isinstance(payload, list):
+                raw_accounts = payload
+            elif isinstance(payload, dict):
+                for key in ("items", "accounts", "data", "content", "accountList"):
+                    v = payload.get(key)
+                    if isinstance(v, list):
+                        raw_accounts = v
+                        break
+            if raw_accounts is None:
+                raw_accounts = []
+
+            print("[balances] Balances (API):", flush=True)
+            for idx, acc in enumerate(raw_accounts):
+                if not isinstance(acc, dict):
+                    continue
+                name = _extract_first(acc, ["name", "alias", "productName", "description", "accountLabel", "accountName"]) or "N/A"
+
+                balance, currency = _extract_money_from_account(
+                    acc,
+                    ["balance", "accountBalance", "amount", "currentBalance", "value"],
+                    ["currency", "ccy"],
+                )
+                disposable, disp_currency = _extract_money_from_account(
+                    acc,
+                    ["disposable", "disposableAmount", "available", "availableAmount", "disposableBalance"],
+                    ["currency", "ccy"],
+                )
+                if disp_currency is None:
+                    disp_currency = currency
+
+                bal_str = fmt(balance, currency)
+                disp_str = fmt(disposable, disp_currency)
+                print(f"- {name}: {bal_str} (disposable: {disp_str})", flush=True)
 
             return 0
         finally:
@@ -1491,6 +2086,319 @@ def cmd_export(args):
             files = download_data_exports(page, export_type, download_dir=output_dir)
             label = EXPORT_TYPE_LABELS[export_type]
             print(f"\n[george] Downloaded {len(files)} {label} export files")
+        finally:
+            context.close()
+
+    return 0
+
+
+def cmd_datacarrier_upload(args):
+    """Upload a data-carrier file."""
+    file_path = Path(args.file).expanduser()
+    if not file_path.exists() or not file_path.is_file():
+        print(f"[datacarrier-upload] ERROR: File not found: {file_path}", flush=True)
+        return 1
+
+    output_dir = Path(args.output) if args.output else None
+    if output_dir:
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    with sync_playwright() as p:
+        context = p.chromium.launch_persistent_context(
+            user_data_dir=str(PROFILE_DIR),
+            headless=not args.visible,
+            viewport={"width": 1280, "height": 900},
+        )
+        context.on("dialog", lambda d: d.accept())
+        page = context.new_page()
+
+        try:
+            if not login(page, timeout_seconds=_login_timeout(args)):
+                return 1
+
+            dismiss_modals(page)
+            payload = upload_datacarrier_file(page, file_path, args.type)
+            if payload is None:
+                return 1
+
+            resp_id = None
+            resp_status = None
+            if isinstance(payload, dict):
+                resp_id = (
+                    payload.get("id")
+                    or payload.get("fileId")
+                    or payload.get("uuid")
+                    or payload.get("reference")
+                    or payload.get("datacarrierFileId")
+                )
+                resp_status = payload.get("status") or payload.get("state") or payload.get("result")
+
+            id_part = f" id={resp_id}" if resp_id is not None else ""
+            status_part = f" status={resp_status}" if resp_status is not None else ""
+            print(f"[datacarrier-upload] Uploaded {file_path.name}{id_part}{status_part}", flush=True)
+
+            if output_dir:
+                ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+                out_path = output_dir / f"{file_path.name}.datacarrier.{ts}.json"
+                with open(out_path, "w") as f:
+                    json.dump(payload, f, indent=2, sort_keys=True)
+                print(f"[datacarrier-upload] Saved response: {out_path}", flush=True)
+
+            if args.wait_done:
+                if resp_id is None:
+                    print("[datacarrier-upload] --wait-done requested but upload response has no file id", flush=True)
+                else:
+                    print(f"[datacarrier-upload] Waiting for file id={resp_id} to reach DONE...", flush=True)
+                    last_state = None
+                    start = time.time()
+                    timeout_s = max(int(getattr(args, "wait_done_timeout", 120) or 0), 0)
+                    while True:
+                        if timeout_s > 0 and time.time() - start > timeout_s:
+                            print(f"[datacarrier-upload] Timed out after {timeout_s}s waiting for DONE", flush=True)
+                            break
+                        try:
+                            resp = context.request.get(_build_datacarrier_files_list_url(), timeout=30000)
+                            payload = resp.json()
+                        except Exception as e:
+                            print(f"[datacarrier-upload] Polling error: {e}", flush=True)
+                            time.sleep(3)
+                            continue
+
+                        state, _item = _extract_datacarrier_file_state(payload, resp_id)
+                        if state and state != last_state:
+                            print(f"[datacarrier-upload] State={state}", flush=True)
+                            last_state = state
+                        if state == "DONE":
+                            break
+                        time.sleep(3)
+        finally:
+            context.close()
+
+    return 0
+
+
+def cmd_datacarrier_sign(args):
+    """Sign a data-carrier upload."""
+    datacarrier_id = args.datacarrier_id
+    output_dir = Path(args.output) if args.output else None
+    if output_dir:
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    with sync_playwright() as p:
+        context = p.chromium.launch_persistent_context(
+            user_data_dir=str(PROFILE_DIR),
+            headless=not args.visible,
+            viewport={"width": 1280, "height": 900},
+        )
+        context.on("dialog", lambda d: d.accept())
+        page = context.new_page()
+
+        try:
+            if not login(page, timeout_seconds=_login_timeout(args)):
+                return 1
+
+            dismiss_modals(page)
+            sign_page_url = DATACARRIER_SIGN_URL_TEMPLATE.format(datacarrier_id=datacarrier_id)
+            sign_api_path = f"/rest/netbanking/my/orders/datacarriers/{datacarrier_id}/sign/"
+            sign_api_base = DATACARRIER_SIGN_API_TEMPLATE.format(datacarrier_id=datacarrier_id)
+
+            # Fast-path: if caller already knows the signId (from DevTools), we can skip UI network discovery.
+            if getattr(args, "sign_id", None):
+                sign_id = str(getattr(args, "sign_id")).strip()
+                sign_api_url = f"{sign_api_base}{sign_id}"
+
+                try:
+                    post_response = context.request.post(
+                        sign_api_url,
+                        data=json.dumps({"authorizationType": "GEORGE_TOKEN"}),
+                        headers={"Content-Type": "application/json"},
+                        timeout=30000,
+                    )
+                except Exception as e:
+                    print(f"[datacarrier-sign] ERROR: Signing request failed: {e}", flush=True)
+                    return 1
+
+                try:
+                    post_payload = post_response.json() if post_response else None
+                except Exception:
+                    try:
+                        post_payload = {"raw": post_response.text()} if post_response else None
+                    except Exception:
+                        post_payload = {"raw": "<unparseable response>"} if post_response else None
+
+                auth_req_id = None
+                poll_url = None
+                poll_interval_ms = None
+                if isinstance(post_payload, dict):
+                    auth_req_id = post_payload.get("authorizationRequestId")
+                    poll = post_payload.get("poll")
+                    if isinstance(poll, dict):
+                        poll_url = poll.get("url")
+                        poll_interval_ms = poll.get("interval")
+
+                _sid, state = _extract_sign_state(post_payload if isinstance(post_payload, dict) else None)
+                state = state or (post_payload.get("state") if isinstance(post_payload, dict) else None)
+
+                auth_part = f" authReqId={auth_req_id}" if auth_req_id else ""
+                state_part = f" state={state}" if state else ""
+                print(f"[datacarrier-sign] id={datacarrier_id} signId={sign_id}{state_part}{auth_part}", flush=True)
+
+                if output_dir:
+                    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+                    out_path = output_dir / f"datacarrier-sign.{datacarrier_id}.{ts}.json"
+                    with open(out_path, "w") as f:
+                        json.dump(post_payload, f, indent=2, sort_keys=True)
+                    print(f"[datacarrier-sign] Saved response: {out_path}", flush=True)
+
+                # Optional: poll until the signing flow finishes (best-effort; shape may vary).
+                if args.timeout and args.timeout > 0 and poll_url:
+                    start = time.time()
+                    last_state = state
+                    interval_s = (poll_interval_ms / 1000.0) if isinstance(poll_interval_ms, (int, float)) and poll_interval_ms > 0 else float(max(args.poll, 1))
+                    while time.time() - start < args.timeout:
+                        try:
+                            resp = context.request.get(poll_url, timeout=30000)
+                            pj = resp.json()
+                        except Exception:
+                            time.sleep(interval_s)
+                            continue
+
+                        new_state = None
+                        if isinstance(pj, dict):
+                            new_state = (pj.get("state") or (pj.get("signInfo") or {}).get("state") or (pj.get("authorization") or {}).get("state"))
+                        if new_state and new_state != last_state:
+                            print(f"[datacarrier-sign] state={new_state}", flush=True)
+                            last_state = new_state
+                        if new_state and new_state not in ("OPEN", "PENDING", "PROCESSING"):
+                            break
+                        time.sleep(interval_s)
+
+                return 0
+
+            def _is_sign_any(resp) -> bool:
+                try:
+                    return sign_api_path in (resp.url or "") and resp.request.method in ("GET", "POST")
+                except Exception:
+                    return False
+
+            def _is_sign_post(resp) -> bool:
+                try:
+                    return resp.request.method == "POST" and sign_api_path in (resp.url or "")
+                except Exception:
+                    return False
+
+            initial_wait = args.timeout if args.timeout and args.timeout > 0 else 120
+            response = None
+            try:
+                # Some George flows only load sign-info after interacting with the page.
+                with page.expect_response(_is_sign_any, timeout=initial_wait * 1000) as resp_info:
+                    page.goto(sign_page_url, wait_until="domcontentloaded")
+                    time.sleep(2)
+                    dismiss_modals(page)
+                    # Best-effort: trigger any lazy-loaded sign-info.
+                    _click_confirmation_button(page)
+                response = resp_info.value
+            except PlaywrightTimeout:
+                print(
+                    "[datacarrier-sign] ERROR: Timed out waiting for sign info (GET/POST). "
+                    "Is the datacarrier id valid and in the right state?",
+                    flush=True,
+                )
+                return 1
+
+            try:
+                payload = response.json() if response else None
+            except Exception:
+                try:
+                    payload = {"raw": response.text()} if response else None
+                except Exception:
+                    payload = {"raw": "<unparseable response>"} if response else None
+
+            sign_id, state = _extract_sign_state(payload if isinstance(payload, dict) else None)
+            sign_id = sign_id or _extract_sign_id_from_url(response.url if response else None)
+            sign_api_url = response.url if response and sign_id else f"{sign_api_base}{sign_id}" if sign_id else sign_api_base
+
+            if output_dir:
+                ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+                out_path = output_dir / f"datacarrier-sign.{datacarrier_id}.{ts}.json"
+                with open(out_path, "w") as f:
+                    json.dump(payload, f, indent=2, sort_keys=True)
+                print(f"[datacarrier-sign] Saved response: {out_path}", flush=True)
+
+            # If the first observed response was already the POST, reuse it.
+            post_response = response if (response and response.request.method == "POST") else None
+
+            # If the POST happened in the background (e.g. triggered by our earlier click), catch it.
+            if post_response is None:
+                try:
+                    post_response = page.wait_for_response(_is_sign_post, timeout=2000)
+                except Exception:
+                    post_response = None
+
+            # Otherwise trigger it explicitly.
+            if post_response is None:
+                try:
+                    with page.expect_response(_is_sign_post, timeout=10000) as resp_info:
+                        _click_confirmation_button(page)
+                    post_response = resp_info.value
+                except PlaywrightTimeout:
+                    post_response = None
+
+            if post_response is None:
+                try:
+                    post_response = context.request.post(
+                        sign_api_url,
+                        data=json.dumps({"authorizationType": "GEORGE_TOKEN"}),
+                        headers={"Content-Type": "application/json"},
+                        timeout=30000,
+                    )
+                except Exception as e:
+                    print(f"[datacarrier-sign] ERROR: Signing request failed: {e}", flush=True)
+                    return 1
+
+            try:
+                post_payload = post_response.json() if post_response else None
+            except Exception:
+                try:
+                    post_payload = {"raw": post_response.text()} if post_response else None
+                except Exception:
+                    post_payload = {"raw": "<unparseable response>"} if post_response else None
+
+            auth_req_id = None
+            if isinstance(post_payload, dict):
+                auth_req_id = (
+                    post_payload.get("authorizationRequestId")
+                    or (post_payload.get("authorization") or {}).get("authorizationRequestId")
+                    or (post_payload.get("authorizationRequest") or {}).get("id")
+                )
+            sign_id, state = _extract_sign_state(post_payload if isinstance(post_payload, dict) else None)
+            sign_id = sign_id or _extract_sign_id_from_url(post_response.url if post_response else None)
+            id_part = f" id={datacarrier_id}"
+            sign_part = f" signId={sign_id}" if sign_id is not None else ""
+            state_part = f" state={state}" if state is not None else ""
+            auth_part = f" authReqId={auth_req_id}" if auth_req_id is not None else ""
+            print(f"[datacarrier-sign]{id_part}{sign_part}{state_part}{auth_part}", flush=True)
+
+            if args.timeout and args.timeout > 0:
+                try:
+                    thank_you = page.get_by_text("Thank you for signing.")
+                    thank_you.wait_for(timeout=args.timeout * 1000)
+                except Exception:
+                    pass
+
+                try:
+                    ok_clicked = _click_first_visible_button(
+                        page,
+                        [
+                            'button:has-text("OK")',
+                            'button:has-text("Ok")',
+                            'button:has-text("Okay")',
+                        ],
+                    )
+                    if ok_clicked:
+                        page.wait_for_url(re.compile(r".*#/datacarrier/dataCarrierList"), timeout=args.timeout * 1000)
+                except Exception:
+                    pass
         finally:
             context.close()
 
@@ -1577,6 +2485,8 @@ Examples:
   george.py export --type mt940                  # Download MT940 data exports
   george.py transactions -a familie              # Download transactions (CSV default)
   george.py transactions -a familie -f json      # Download transactions as JSON
+  george.py datacarrier-upload file.xml          # Upload data-carrier file
+  george.py datacarrier-sign 123456              # Sign data-carrier upload
         """
     )
     
@@ -1603,11 +2513,13 @@ Examples:
 
     # accounts
     acc_parser = subparsers.add_parser("accounts", help="List available accounts")
-    acc_parser.add_argument("--fetch", action="store_true", help="Fetch live from George (requires login); updates config.json")
+    acc_parser.add_argument("--fetch", action="store_true", help="Alias for default live fetch (updates config.json)")
+    acc_parser.add_argument("--no-fetch", action="store_true", help="List cached config only (no API call)")
+    acc_parser.add_argument("--json", action="store_true", help="Output canonical JSON")
     acc_parser.set_defaults(func=cmd_accounts)
 
     # balances
-    bal_parser = subparsers.add_parser("balances", help="List all accounts with balances (overview)")
+    bal_parser = subparsers.add_parser("balances", help="List all accounts with balances (API)")
     bal_parser.set_defaults(func=cmd_balances)
 
     # statements
@@ -1635,6 +2547,33 @@ Examples:
                                help="Export type (default: camt53)")
     export_parser.add_argument("-o", "--output", help="Output directory")
     export_parser.set_defaults(func=cmd_export)
+
+    # datacarrier-upload
+    dc_upload_parser = subparsers.add_parser(
+        "datacarrier-upload",
+        help="Upload a data-carrier file",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    dc_upload_parser.add_argument("file", help="Data-carrier file path to upload")
+    dc_upload_parser.add_argument("--type", default="PACKAGE", help="Data-carrier type (default: PACKAGE)")
+    dc_upload_parser.add_argument("-o", "--output", help="Output directory for response JSON")
+    dc_upload_parser.add_argument("--wait-done", action="store_true", help="Poll until uploaded file state is DONE")
+    dc_upload_parser.add_argument("--wait-done-timeout", type=int, default=120,
+                                  help="Max seconds to wait for DONE (default: 120; 0 disables timeout)")
+    dc_upload_parser.set_defaults(func=cmd_datacarrier_upload)
+
+    # datacarrier-sign
+    dc_sign_parser = subparsers.add_parser(
+        "datacarrier-sign",
+        help="Sign a data-carrier upload",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    dc_sign_parser.add_argument("datacarrier_id", help="Data-carrier upload id to sign")
+    dc_sign_parser.add_argument("--sign-id", default=None, help="Optional signId (if you already captured it from the API/DevTools)")
+    dc_sign_parser.add_argument("--timeout", type=int, default=120, help="Polling timeout in seconds (default: 120; 0 disables polling)")
+    dc_sign_parser.add_argument("--poll", type=int, default=3, help="Polling interval in seconds (default: 3)")
+    dc_sign_parser.add_argument("-o", "--output", help="Output directory for response JSON")
+    dc_sign_parser.set_defaults(func=cmd_datacarrier_sign)
 
     # transactions (primary transaction export command)
     transactions_parser = subparsers.add_parser("transactions", help="Download transactions (csv/json/ofx/xlsx)")
