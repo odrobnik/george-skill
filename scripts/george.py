@@ -2465,26 +2465,57 @@ def fetch_transactions_export(context, access_token: str, account_id: str, date_
 
 
 def _canonicalize_george_transaction(tx: dict) -> dict:
-    # Best-effort mapping from George export.json to our canonical schema.
-    # Keep raw under 'raw' when DEBUG_ENABLED.
-    out = {}
+    """Best-effort mapping from George export.json to our canonical schema.
+
+    Observed shape (from DevTools):
+    - booking: "2026-01-02T00:00:00.000+0100"
+    - valuation: "2026-01-02T00:00:00.000+0100"
+    - partnerName, partnerAccount.{iban,bic}
+    - amount.{value,precision,currency}
+    - reference, referenceNumber, receiverReference
+    - sepaMandateId, sepaCreditorId
+
+    We keep bank-native payload separately in wrapper["raw"] when --debug.
+    """
+
+    out: dict = {}
+
+    # status (export is booked history)
+    out["status"] = "booked"
 
     # dates
-    bd = tx.get("booking") or tx.get("bookingDate")
-    if isinstance(bd, str):
-        # sometimes includes time; normalize to date-only if possible
-        out["bookingDate"] = bd[:10]
+    booking = tx.get("booking")
+    if isinstance(booking, str) and len(booking) >= 10:
+        out["bookingDate"] = booking[:10]
+
+    valuation = tx.get("valuation") or tx.get("valueDate")
+    if isinstance(valuation, str) and len(valuation) >= 10:
+        out["valueDate"] = valuation[:10]
 
     # amount
-    amt = tx.get("amount")
-    ccy = tx.get("currency")
-    if isinstance(amt, (int, float)) and isinstance(ccy, str):
-        out["amount"] = {"amount": float(amt), "currency": ccy}
+    amount_obj = tx.get("amount")
+    if isinstance(amount_obj, dict):
+        v = amount_obj.get("value")
+        prec = amount_obj.get("precision")
+        cur = amount_obj.get("currency")
+        if isinstance(v, (int, float)) and isinstance(prec, int) and isinstance(cur, str) and cur:
+            out["amount"] = {"amount": float(v) / (10 ** prec), "currency": cur}
 
     # counterparty
-    recv = tx.get("receiver")
-    if isinstance(recv, str) and recv.strip():
-        out["counterparty"] = {"name": recv.strip()}
+    cp_name = tx.get("partnerName") or tx.get("receiver") or tx.get("receiverName")
+    partner_account = tx.get("partnerAccount") if isinstance(tx.get("partnerAccount"), dict) else None
+    cp: dict = {}
+    if isinstance(cp_name, str) and cp_name.strip():
+        cp["name"] = cp_name.strip()
+    if isinstance(partner_account, dict):
+        iban = partner_account.get("iban")
+        bic = partner_account.get("bic")
+        if isinstance(iban, str) and iban.strip():
+            cp["iban"] = iban.strip()
+        if isinstance(bic, str) and bic.strip():
+            cp["bic"] = bic.strip()
+    if cp:
+        out["counterparty"] = cp
 
     # description/purpose
     ref = tx.get("reference")
@@ -2495,12 +2526,32 @@ def _canonicalize_george_transaction(tx: dict) -> dict:
         out["purpose"] = note.strip()
 
     # references
+    refs: dict = {}
     rn = tx.get("referenceNumber")
     if isinstance(rn, str) and rn.strip():
-        out["references"] = {"bankReference": rn.strip()}
+        refs["bankReference"] = rn.strip()
 
-    # stable id (if present)
-    tid = tx.get("id") or tx.get("transactionId")
+    receiver_ref = tx.get("receiverReference")
+    if isinstance(receiver_ref, str) and receiver_ref.strip():
+        refs["paymentReference"] = receiver_ref.strip()
+
+    mandate = tx.get("sepaMandateId")
+    if isinstance(mandate, str) and mandate.strip():
+        refs["mandateId"] = mandate.strip()
+
+    creditor = tx.get("sepaCreditorId")
+    if isinstance(creditor, str) and creditor.strip():
+        refs["creditorId"] = creditor.strip()
+
+    e2e = tx.get("e2eReference")
+    if isinstance(e2e, str) and e2e.strip():
+        refs["endToEndId"] = e2e.strip()
+
+    if refs:
+        out["references"] = refs
+
+    # stable id (rarely present in export)
+    tid = tx.get("transactionId") or tx.get("containedTransactionId")
     if tid is not None:
         out["id"] = str(tid)
 
