@@ -176,8 +176,13 @@ def _ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
 
-def _write_debug_json(prefix: str, payload) -> Path:
+DEBUG_ENABLED: bool = False
+
+
+def _write_debug_json(prefix: str, payload) -> Path | None:
     # Write bank-native payload to a timestamped JSON file for debugging.
+    if not DEBUG_ENABLED:
+        return None
     _ensure_dir(DEBUG_DIR)
     ts = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
     out = DEBUG_DIR / f"{ts}-{prefix}.json"
@@ -2499,6 +2504,7 @@ Examples:
     parser.add_argument("--dir", default=None, help="State directory (default: ~/.clawdbot/george; override via GEORGE_DIR)")
     parser.add_argument("--login-timeout", type=int, default=DEFAULT_LOGIN_TIMEOUT, help="Seconds to wait for phone approval")
     parser.add_argument("--user-id", default=None, help="Override George user number/username (or set GEORGE_USER_ID)")
+    parser.add_argument("--debug", action="store_true", help="Save bank-native payloads to <stateDir>/debug (default: off)")
     
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -2600,6 +2606,10 @@ Examples:
     
     args = parser.parse_args()
     _apply_state_dir(getattr(args, "dir", None))
+
+    # Enable debug dump (bank-native payloads) only when requested.
+    global DEBUG_ENABLED
+    DEBUG_ENABLED = bool(getattr(args, "debug", False))
 
     # Make --user-id available to login() without threading args everywhere.
     global USER_ID_OVERRIDE

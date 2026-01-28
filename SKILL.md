@@ -105,6 +105,7 @@ Supported formats: `csv` (default), `json`, `ofx`, `xlsx`
 --dir DIR          State directory (default: ~/.clawdbot/george; override via GEORGE_DIR)
 --login-timeout N  Seconds to wait for phone approval (default: 180)
 --user-id ID       Override user number/username (or set GEORGE_USER_ID)
+--debug            Save bank-native payloads to `~/.clawdbot/george/debug` (default: off)
 ```
 
 You can also put `GEORGE_USER_ID=...` in `~/.clawdbot/george/.env`.
