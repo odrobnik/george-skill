@@ -1,4 +1,4 @@
-# George (Clawdbot Skill)
+# George (Moltbot Skill)
 
 Banking automation for **George (Erste Bank / Sparkasse Austria)** using Playwright.
 
@@ -14,6 +14,6 @@ python3 scripts/george.py balances
 ```
 
 State is stored outside the repo:
-- `~/.clawdbot/george/config.json`
-- `~/.clawdbot/george/.pw-profile/`
-- `~/.clawdbot/george/data/`
+- `~/.moltbot/george/config.json`
+- `~/.moltbot/george/.pw-profile/`
+- `~/.moltbot/george/data/`

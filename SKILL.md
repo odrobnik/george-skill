@@ -26,7 +26,7 @@ python3 {baseDir}/scripts/george.py accounts
 
 What `setup` does:
 - Prompts for your **George user number / username** (`user_id`)
-- Writes `~/.clawdbot/george/config.json` (accounts stored as an array)
+- Writes `~/.moltbot/george/config.json` (accounts stored as an array)
 - Ensures Playwright is installed and installs Chromium
 
 ### Manual setup (alternative)
@@ -35,8 +35,8 @@ What `setup` does:
 pipx install playwright
 playwright install chromium
 
-mkdir -p ~/.clawdbot/george
-cat > ~/.clawdbot/george/config.json <<EOF
+mkdir -p ~/.moltbot/george
+cat > ~/.moltbot/george/config.json <<EOF
 {
   "user_id": "YOUR_USER_ID",
   "accounts": {}
@@ -55,7 +55,7 @@ python3 {baseDir}/scripts/george.py login
 python3 {baseDir}/scripts/george.py logout
 ```
 
-Session is persisted in `~/.clawdbot/george/.pw-profile/` (or `--dir`).
+Session is persisted in `~/.moltbot/george/.pw-profile/` (or `--dir`).
 
 ### Accounts
 
@@ -102,19 +102,19 @@ Supported formats: `csv` (default), `json`, `ofx`, `xlsx`
 
 ```
 --visible          Show browser window (debugging)
---dir DIR          State directory (default: ~/.clawdbot/george; override via GEORGE_DIR)
+--dir DIR          State directory (default: ~/.moltbot/george; override via GEORGE_DIR)
 --login-timeout N  Seconds to wait for phone approval (default: 180)
 --user-id ID       Override user number/username (or set GEORGE_USER_ID)
---debug            Save bank-native payloads to `~/.clawdbot/george/debug` (default: off)
+--debug            Save bank-native payloads to `~/.moltbot/george/debug` (default: off)
 ```
 
-You can also put `GEORGE_USER_ID=...` in `~/.clawdbot/george/.env`.
+You can also put `GEORGE_USER_ID=...` in `~/.moltbot/george/.env`.
 
 ## Output / state locations
 
-- **Config:** `~/.clawdbot/george/config.json` (or `--dir`)
-- **Session:** `~/.clawdbot/george/.pw-profile/` (or `--dir`)
-- **Downloads:** `~/.clawdbot/george/data/` (or `--dir`)
+- **Config:** `~/.moltbot/george/config.json` (or `--dir`)
+- **Session:** `~/.moltbot/george/.pw-profile/` (or `--dir`)
+- **Downloads:** `~/.moltbot/george/data/` (or `--dir`)
 
 ## Security notes
 
