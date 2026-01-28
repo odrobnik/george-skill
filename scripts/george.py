@@ -1863,12 +1863,7 @@ def cmd_accounts(args):
             page = context.new_page()
 
             try:
-                if not login(page, timeout_seconds=_login_timeout(args)):
-                    return 1
-
-                dismiss_modals(page)
-
-                # Try cached token first to avoid re-capturing headers.
+                # 1) Prefer cached token to avoid interactive login.
                 token_cache = _load_token_cache() or {}
                 token = token_cache.get("accessToken") if isinstance(token_cache, dict) else None
                 if isinstance(token, str) and token.strip():
@@ -1877,7 +1872,13 @@ def cmd_accounts(args):
                     except Exception:
                         raw_payload = None
 
+                # 2) If token didn't work, do interactive login (phone approval) and capture auth.
                 if raw_payload is None:
+                    if not login(page, timeout_seconds=_login_timeout(args)):
+                        return 1
+
+                    dismiss_modals(page)
+
                     auth_header = capture_bearer_auth_header(context, page, timeout_s=10)
                     if not auth_header:
                         print("[accounts] ERROR: Could not capture API Authorization header", flush=True)
