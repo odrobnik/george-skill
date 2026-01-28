@@ -68,7 +68,7 @@ DEFAULT_OUTPUT_DIR: Path = STATE_DIR / "data"
 DEBUG_DIR: Path = STATE_DIR / "debug"
 TOKEN_CACHE_FILE: Path = PROFILE_DIR / "token.json"
 
-DEFAULT_LOGIN_TIMEOUT = 60  # seconds
+DEFAULT_LOGIN_TIMEOUT = 180  # seconds (George app approval window is ~3 minutes)
 
 # User id override for this run (set from CLI --user-id)
 USER_ID_OVERRIDE: str | None = None

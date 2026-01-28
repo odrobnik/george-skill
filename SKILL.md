@@ -103,7 +103,7 @@ Supported formats: `csv` (default), `json`, `ofx`, `xlsx`
 ```
 --visible          Show browser window (debugging)
 --dir DIR          State directory (default: ~/.clawdbot/george; override via GEORGE_DIR)
---login-timeout N  Seconds to wait for phone approval (default: 60)
+--login-timeout N  Seconds to wait for phone approval (default: 180)
 --user-id ID       Override user number/username (or set GEORGE_USER_ID)
 ```
 
