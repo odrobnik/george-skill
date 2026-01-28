@@ -2417,30 +2417,48 @@ def cmd_datacarrier_sign(args):
 def cmd_transactions(args):
     """Download transactions for an account in the specified format."""
     account = get_account(args.account)
-    output_dir = Path(args.output) if args.output else DEFAULT_OUTPUT_DIR
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_target = args.output
     
     fmt = args.format.lower()
     if fmt not in TRANSACTION_EXPORT_FORMATS:
         print(f"[transactions] Invalid format '{fmt}'. Supported: {', '.join(TRANSACTION_EXPORT_FORMATS)}")
         return 1
 
-    # Normalize date range: --to defaults to today; future --to clamped to today
+    # Validate ISO dates
+    from datetime import datetime
     try:
-        date_from, date_to = _normalize_date_range(args.date_from, args.date_to)
-    except Exception as e:
-        print(f"[transactions] Invalid date range: {e}")
+        dt_from = datetime.strptime(args.date_from, "%Y-%m-%d")
+        dt_until = datetime.strptime(args.date_until, "%Y-%m-%d")
+    except ValueError:
+        print("ERROR: Dates must be in YYYY-MM-DD format.")
         return 1
+    
+    # Convert to DD.MM.YYYY for internal use
+    date_from_internal = dt_from.strftime("%d.%m.%Y")
+    date_to_internal = dt_until.strftime("%d.%m.%Y")
 
-    if args.date_to:
-        # Informative log if user gave a future date
-        try:
-            if _parse_ddmmyyyy(args.date_to) > date.today():
-                print(f"[transactions] NOTE: --to {args.date_to} is in the future; using today ({date_to}) instead", flush=True)
-        except Exception:
-            pass
+    if dt_until.date() > date.today():
+         print(f"[transactions] NOTE: --until {args.date_until} is in the future; using today instead", flush=True)
 
-    print(f"[george] Downloading {fmt.upper()} for {account['name']} ({date_from or 'DEFAULT'} -> {date_to})")
+    # Determine output directory/path
+    # If output_target is a dir (or ends with slash), we write to it with auto name.
+    # If it is a file path, we use it as base.
+    
+    output_dir = DEFAULT_OUTPUT_DIR # Fallback
+    final_file_base = None
+    
+    if output_target:
+        p = Path(output_target)
+        if p.is_dir() or str(output_target).endswith(os.sep):
+            output_dir = p
+            output_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            # File base
+            p.parent.mkdir(parents=True, exist_ok=True)
+            output_dir = p.parent
+            final_file_base = p.name
+
+    print(f"[george] Downloading {fmt.upper()} for {account['name']} ({args.date_from} -> {args.date_until})")
 
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
@@ -2458,165 +2476,36 @@ def cmd_transactions(args):
                 return 1
 
             dismiss_modals(page)
+            
+            # Use internal downloader (which still wants DD.MM.YYYY)
             files = download_transactions(
                 page, account,
-                date_from=date_from,
-                date_to=date_to,
+                date_from=date_from_internal,
+                date_to=date_to_internal,
                 download_dir=output_dir,
                 fmt=fmt,
             )
 
-            print(f"\n[george] Downloaded {len(files)} {fmt.upper()} files")
+            # If we had a specific target filename, rename the result
+            if final_file_base and files:
+                src = files[0]
+                # Check extension
+                if not final_file_base.lower().endswith(f".{fmt}"):
+                    final_file_base += f".{fmt}"
+                dest = output_dir / final_file_base
+                src.rename(dest)
+                files = [dest]
+                print(f"[transactions] Renamed to: {dest}")
+
+            print(f"[transactions] Downloaded {len(files)} {fmt.upper()} files")
+            
+            # If JSON requested, ensure it is wrapped in canonical schema
+            # NOTE: The 'download_transactions' logic for JSON currently just saves whatever George gives.
+            # We should ideally wrap it if we want unification.
+            # For now, we trust the download. 
+            # TODO: Add wrapping logic here similar to elba.py if George JSON isn't already compatible.
+            
         finally:
             context.close()
 
     return 0
-
-
-def cmd_csv(args):
-    """Download transaction CSV for an account. (Deprecated: use 'transactions' instead)"""
-    print("[csv] Note: 'csv' command is deprecated. Use 'transactions -f csv' instead.", flush=True)
-    # Create a fake args object with format=csv
-    args.format = "csv"
-    return cmd_transactions(args)
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="George Banking Automation",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  george.py setup                                # Initial setup (user ID + playwright)
-  george.py accounts                             # If config has no accounts: fetch + save
-  george.py statements -a main -y 2025 -q 4      # Download PDF statements
-  george.py export                               # Download CAMT53 data exports (all accounts)
-  george.py export --type mt940                  # Download MT940 data exports
-  george.py transactions -a familie              # Download transactions (CSV default)
-  george.py transactions -a familie -f json      # Download transactions as JSON
-  george.py datacarrier-upload file.xml          # Upload data-carrier file
-  george.py datacarrier-sign 123456              # Sign data-carrier upload
-        """
-    )
-    
-    # Global options
-    parser.add_argument("--visible", action="store_true", help="Show browser window")
-    parser.add_argument("--dir", default=None, help="State directory (default: ~/.moltbot/george; override via GEORGE_DIR)")
-    parser.add_argument("--login-timeout", type=int, default=DEFAULT_LOGIN_TIMEOUT, help="Seconds to wait for phone approval")
-    parser.add_argument("--user-id", default=None, help="Override George user number/username (or set GEORGE_USER_ID)")
-    parser.add_argument("--debug", action="store_true", help="Save bank-native payloads to <stateDir>/debug (default: off)")
-    
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    # setup
-    setup_parser = subparsers.add_parser("setup", help="Setup user ID and install playwright")
-    setup_parser.add_argument("--user-id", help="George user ID (8-9 digit number)")
-    setup_parser.set_defaults(func=cmd_setup)
-
-    # login (standalone)
-    login_parser = subparsers.add_parser("login", help="Perform login only")
-    login_parser.set_defaults(func=cmd_login)
-
-    # logout (standalone)
-    logout_parser = subparsers.add_parser("logout", help="Clear session/profile")
-    logout_parser.set_defaults(func=cmd_logout)
-
-    # accounts
-    acc_parser = subparsers.add_parser("accounts", help="List available accounts")
-    acc_parser.add_argument("--fetch", action="store_true", help="Alias for default live fetch (updates config.json)")
-    acc_parser.add_argument("--no-fetch", action="store_true", help="List cached config only (no API call)")
-    acc_parser.add_argument("--json", action="store_true", help="Output canonical JSON")
-    acc_parser.set_defaults(func=cmd_accounts)
-
-    # balances
-    bal_parser = subparsers.add_parser("balances", help="List all accounts with balances (API)")
-    bal_parser.set_defaults(func=cmd_balances)
-
-    # statements
-    stmt_parser = subparsers.add_parser("statements", help="Download PDF statements")
-    stmt_parser.add_argument("-a", "--account", required=True, help="Account key/name/IBAN")
-    stmt_parser.add_argument("-y", "--year", type=int, required=True)
-    stmt_parser.add_argument("-q", "--quarter", type=int, required=True, choices=[1, 2, 3, 4])
-    stmt_parser.add_argument("-o", "--output", help="Output directory")
-    stmt_parser.add_argument("--no-receipts", action="store_true", help="Skip booking receipts")
-    stmt_parser.set_defaults(func=cmd_statements)
-    
-    # export (data export: CAMT53/MT940)
-    export_parser = subparsers.add_parser(
-        "export",
-        help="Download data exports (CAMT53/MT940)",
-        description=(
-            "You can export (download) all available new data and files for all of your set-up accounts "
-            "in order to use them for your bookkeeping. The Data Export is available as soon as the data "
-            "for an account statement are available and a statement request with your selected frequency "
-            "has been done. From then on, the Export will be available for a maximum of 3 months."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    export_parser.add_argument("--type", default=DEFAULT_EXPORT_TYPE, choices=EXPORT_TYPES,
-                               help="Export type (default: camt53)")
-    export_parser.add_argument("-o", "--output", help="Output directory")
-    export_parser.set_defaults(func=cmd_export)
-
-    # datacarrier-upload
-    dc_upload_parser = subparsers.add_parser(
-        "datacarrier-upload",
-        help="Upload a data-carrier file",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    dc_upload_parser.add_argument("file", help="Data-carrier file path to upload")
-    dc_upload_parser.add_argument("--type", default="PACKAGE", help="Data-carrier type (default: PACKAGE)")
-    dc_upload_parser.add_argument("-o", "--output", help="Output directory for response JSON")
-    dc_upload_parser.add_argument("--wait-done", action="store_true", help="Poll until uploaded file state is DONE")
-    dc_upload_parser.add_argument("--wait-done-timeout", type=int, default=120,
-                                  help="Max seconds to wait for DONE (default: 120; 0 disables timeout)")
-    dc_upload_parser.set_defaults(func=cmd_datacarrier_upload)
-
-    # datacarrier-sign
-    dc_sign_parser = subparsers.add_parser(
-        "datacarrier-sign",
-        help="Sign a data-carrier upload",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    dc_sign_parser.add_argument("datacarrier_id", help="Data-carrier upload id to sign")
-    dc_sign_parser.add_argument("--sign-id", default=None, help="Optional signId (if you already captured it from the API/DevTools)")
-    dc_sign_parser.add_argument("--timeout", type=int, default=120, help="Polling timeout in seconds (default: 120; 0 disables polling)")
-    dc_sign_parser.add_argument("--poll", type=int, default=3, help="Polling interval in seconds (default: 3)")
-    dc_sign_parser.add_argument("-o", "--output", help="Output directory for response JSON")
-    dc_sign_parser.set_defaults(func=cmd_datacarrier_sign)
-
-    # transactions (primary transaction export command)
-    transactions_parser = subparsers.add_parser("transactions", help="Download transactions (csv/json/ofx/xlsx)")
-    transactions_parser.add_argument("-a", "--account", required=True, help="Account key/name/IBAN")
-    transactions_parser.add_argument("-f", "--format", default=DEFAULT_TRANSACTION_FORMAT,
-                                     choices=TRANSACTION_EXPORT_FORMATS,
-                                     help="Export format (default: csv)")
-    transactions_parser.add_argument("-o", "--output", help="Output directory")
-    transactions_parser.add_argument("--from", dest="date_from", help="Start date (DD.MM.YYYY)")
-    transactions_parser.add_argument("--to", dest="date_to", help="End date (DD.MM.YYYY)")
-    transactions_parser.set_defaults(func=cmd_transactions)
-    
-    # csv (deprecated alias for transactions -f csv)
-    csv_parser = subparsers.add_parser("csv", help="[DEPRECATED] Use 'transactions' instead")
-    csv_parser.add_argument("-a", "--account", required=True, help="Account key/name/IBAN")
-    csv_parser.add_argument("-o", "--output", help="Output directory")
-    csv_parser.add_argument("--from", dest="date_from", help="Start date (DD.MM.YYYY)")
-    csv_parser.add_argument("--to", dest="date_to", help="End date (DD.MM.YYYY)")
-    csv_parser.set_defaults(func=cmd_csv)
-    
-    args = parser.parse_args()
-    _apply_state_dir(getattr(args, "dir", None))
-
-    # Enable debug dump (bank-native payloads) only when requested.
-    global DEBUG_ENABLED
-    DEBUG_ENABLED = bool(getattr(args, "debug", False))
-
-    # Make --user-id available to login() without threading args everywhere.
-    global USER_ID_OVERRIDE
-    USER_ID_OVERRIDE = getattr(args, "user_id", None)
-
-    return args.func(args)
-
-
-if __name__ == "__main__":
-    sys.exit(main() or 0)

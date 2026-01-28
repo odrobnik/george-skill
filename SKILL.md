@@ -88,13 +88,15 @@ python3 {baseDir}/scripts/george.py export --type mt940
 ### Transactions
 
 ```bash
-python3 {baseDir}/scripts/george.py transactions -a main                  # CSV (default)
-python3 {baseDir}/scripts/george.py transactions -a main -f json
-python3 {baseDir}/scripts/george.py transactions -a main -f ofx
-python3 {baseDir}/scripts/george.py transactions -a main -f xlsx
-
-python3 {baseDir}/scripts/george.py transactions -a main --from 01.01.2025 --to 31.01.2025
+python3 {baseDir}/scripts/george.py transactions \
+  --account main \
+  --from 2025-01-01 --until 2025-01-31 \
+  --format json \
+  --out ~/transactions/2025_jan
 ```
+
+Supported formats: `csv` (default), `json`, `ofx`, `xlsx`
+
 
 Supported formats: `csv` (default), `json`, `ofx`, `xlsx`
 
