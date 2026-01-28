@@ -228,7 +228,10 @@ def _canonical_account_type_george(raw_type: str | None) -> str:
     t = (raw_type or "").lower()
     return {
         "currentaccount": "checking",
+        "current": "checking",
+        "giro": "checking",
         "saving": "savings",
+        "savings": "savings",
         "loan": "loan",
         "credit": "credit",
         "kredit": "credit",
