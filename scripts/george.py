@@ -1571,17 +1571,9 @@ def _normalize_date_range(date_from: str | None, date_to: str | None) -> tuple[s
     return df_s, dt_s
 
 
-# Supported transaction export formats
-TRANSACTION_EXPORT_FORMATS = ["csv", "json", "ofx", "xlsx"]
-DEFAULT_TRANSACTION_FORMAT = "csv"
-
-# Map format names to George UI labels (case-insensitive matching used)
-TRANSACTION_FORMAT_LABELS = {
-    "csv": "CSV",
-    "json": "JSON",
-    "ofx": "OFX",
-    "xlsx": "Excel",  # George may show "Excel" or "XLSX"
-}
+# Supported transaction export formats (unified UX)
+TRANSACTION_EXPORT_FORMATS = ["csv", "json"]
+DEFAULT_TRANSACTION_FORMAT = "json"
 
 def download_transactions(page, account: dict, date_from: str = None, date_to: str = None,
                           download_dir: Path = None, fmt: str = "csv") -> list[Path]:
@@ -2414,11 +2406,111 @@ def cmd_datacarrier_sign(args):
     return 0
 
 
+
+def _george_transactions_export_fields() -> str:
+    # Keep this list stable; it controls what the export endpoint returns.
+    # (Taken from DevTools capture.)
+    return (
+        "booking,receiver,amount,currency,reference,referenceNumber,note,favorite,valuation,"
+        "virtualCardNumber,virtualCardDevice,virtualCardMobilePaymentApplicationName,receiverReference,"
+        "sepaMandateId,sepaCreditorId,ownerAccountTitle,ownerAccountNumber,vopResult,vopMatchedName"
+    )
+
+
+def fetch_transactions_export(context, access_token: str, account_id: str, date_from: str, date_to: str):
+    """Fetch transactions export (JSON) for a George account.
+
+    Endpoint requires:
+    - Authorization: Bearer <token>
+    - Content-Type: application/x-www-form-urlencoded
+    - body: id=<ACCOUNT_ID>
+    - query: from=YYYY-MM-DD&to=YYYY-MM-DD&sort=BOOKING_DATE_ASC&fields=...
+    """
+    fields = _george_transactions_export_fields()
+    url = (
+        "https://api.sparkasse.at/proxy/g/api/my/transactions/export.json"
+        f"?lang=en&fields={fields.replace(',', '%2C')}"
+        f"&sort=BOOKING_DATE_ASC&from={date_from}&to={date_to}"
+        "&continuousCardIdFiltering=false"
+    )
+
+    headers = {
+        "Accept": "*/*",
+        "Accept-Language": "en",
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+
+    body = f"id={account_id}"
+
+    try:
+        resp = context.request.post(url, headers=headers, data=body, timeout=60000)
+    except Exception as e:
+        raise RuntimeError(f"[transactions] API request failed: {e}") from e
+
+    if not resp or not resp.ok:
+        status = resp.status if resp else "N/A"
+        txt = None
+        try:
+            txt = resp.text()
+        except Exception:
+            txt = None
+        raise RuntimeError(f"[transactions] API request failed (status={status}): {txt or '<no body>'}")
+
+    try:
+        return resp.json()
+    except Exception:
+        # last resort: keep raw text
+        return {"raw": resp.text()}
+
+
+def _canonicalize_george_transaction(tx: dict) -> dict:
+    # Best-effort mapping from George export.json to our canonical schema.
+    # Keep raw under 'raw' when DEBUG_ENABLED.
+    out = {}
+
+    # dates
+    bd = tx.get("booking") or tx.get("bookingDate")
+    if isinstance(bd, str):
+        # sometimes includes time; normalize to date-only if possible
+        out["bookingDate"] = bd[:10]
+
+    # amount
+    amt = tx.get("amount")
+    ccy = tx.get("currency")
+    if isinstance(amt, (int, float)) and isinstance(ccy, str):
+        out["amount"] = {"amount": float(amt), "currency": ccy}
+
+    # counterparty
+    recv = tx.get("receiver")
+    if isinstance(recv, str) and recv.strip():
+        out["counterparty"] = {"name": recv.strip()}
+
+    # description/purpose
+    ref = tx.get("reference")
+    note = tx.get("note")
+    if isinstance(ref, str) and ref.strip():
+        out["description"] = ref.strip()
+    if isinstance(note, str) and note.strip():
+        out["purpose"] = note.strip()
+
+    # references
+    rn = tx.get("referenceNumber")
+    if isinstance(rn, str) and rn.strip():
+        out["references"] = {"bankReference": rn.strip()}
+
+    # stable id (if present)
+    tid = tx.get("id") or tx.get("transactionId")
+    if tid is not None:
+        out["id"] = str(tid)
+
+    return out
+
+
 def cmd_transactions(args):
-    """Download transactions for an account in the specified format."""
+    """Download transactions for an account (API-based, unified UX)."""
     account = get_account(args.account)
-    output_target = args.output
-    
+
     fmt = args.format.lower()
     if fmt not in TRANSACTION_EXPORT_FORMATS:
         print(f"[transactions] Invalid format '{fmt}'. Supported: {', '.join(TRANSACTION_EXPORT_FORMATS)}")
@@ -2427,85 +2519,250 @@ def cmd_transactions(args):
     # Validate ISO dates
     from datetime import datetime
     try:
-        dt_from = datetime.strptime(args.date_from, "%Y-%m-%d")
-        dt_until = datetime.strptime(args.date_until, "%Y-%m-%d")
+        datetime.strptime(args.date_from, "%Y-%m-%d")
+        datetime.strptime(args.date_until, "%Y-%m-%d")
     except ValueError:
         print("ERROR: Dates must be in YYYY-MM-DD format.")
         return 1
-    
-    # Convert to DD.MM.YYYY for internal use
-    date_from_internal = dt_from.strftime("%d.%m.%Y")
-    date_to_internal = dt_until.strftime("%d.%m.%Y")
 
-    if dt_until.date() > date.today():
-         print(f"[transactions] NOTE: --until {args.date_until} is in the future; using today instead", flush=True)
+    date_from = args.date_from
+    date_until = args.date_until
 
-    # Determine output directory/path
-    # If output_target is a dir (or ends with slash), we write to it with auto name.
-    # If it is a file path, we use it as base.
-    
-    output_dir = DEFAULT_OUTPUT_DIR # Fallback
-    final_file_base = None
-    
+    # Resolve output base
+    output_target = args.output
+    out_base: Path
     if output_target:
         p = Path(output_target)
         if p.is_dir() or str(output_target).endswith(os.sep):
-            output_dir = p
-            output_dir.mkdir(parents=True, exist_ok=True)
+            p.mkdir(parents=True, exist_ok=True)
+            acct = (account.get("iban") or account.get("id") or "account").replace(" ", "")
+            out_base = p / f"transactions_{acct}_{date_from}_{date_until}"
         else:
-            # File base
             p.parent.mkdir(parents=True, exist_ok=True)
-            output_dir = p.parent
-            final_file_base = p.name
+            out_base = p
+    else:
+        acct = (account.get("iban") or account.get("id") or "account").replace(" ", "")
+        out_base = Path(f"transactions_{acct}_{date_from}_{date_until}")
 
-    print(f"[george] Downloading {fmt.upper()} for {account['name']} ({args.date_from} -> {args.date_until})")
+    print(f"[george] Fetching {fmt.upper()} for {account.get('name')} ({date_from} -> {date_until})", flush=True)
 
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
             user_data_dir=str(PROFILE_DIR),
             headless=not args.visible,
-            accept_downloads=True,
-            downloads_path=str(output_dir),
             viewport={"width": 1280, "height": 900},
         )
-        context.on("dialog", lambda d: d.accept())
         page = context.new_page()
-
         try:
-            if not login(page, timeout_seconds=_login_timeout(args)):
-                return 1
+            # Token reuse -> avoid interactive login when possible
+            token_cache = _load_token_cache() or {}
+            token = token_cache.get("accessToken") if isinstance(token_cache, dict) else None
+            raw_payload = None
 
-            dismiss_modals(page)
-            
-            # Use internal downloader (which still wants DD.MM.YYYY)
-            files = download_transactions(
-                page, account,
-                date_from=date_from_internal,
-                date_to=date_to_internal,
-                download_dir=output_dir,
-                fmt=fmt,
+            if isinstance(token, str) and token.strip():
+                try:
+                    raw_payload = fetch_transactions_export(
+                        context,
+                        token.strip(),
+                        str(account.get("id") or ""),
+                        date_from,
+                        date_until,
+                    )
+                except Exception:
+                    raw_payload = None
+
+            if raw_payload is None:
+                if not login(page, timeout_seconds=_login_timeout(args)):
+                    return 1
+                dismiss_modals(page)
+
+                auth_header = capture_bearer_auth_header(context, page, timeout_s=10)
+                if not auth_header:
+                    print("[transactions] ERROR: Could not capture API Authorization header", flush=True)
+                    return 1
+
+                tok = _extract_bearer_token(auth_header)
+                if not tok:
+                    print("[transactions] ERROR: Could not extract bearer token", flush=True)
+                    return 1
+
+                _save_token_cache(tok, source="auth_header")
+                raw_payload = fetch_transactions_export(
+                    context,
+                    tok,
+                    str(account.get("id") or ""),
+                    date_from,
+                    date_until,
+                )
+
+            # Debug raw
+            raw_path = _write_debug_json(
+                f"transactions-raw-{(account.get('id') or 'account')}-{date_from}-{date_until}",
+                raw_payload,
             )
 
-            # If we had a specific target filename, rename the result
-            if final_file_base and files:
-                src = files[0]
-                # Check extension
-                if not final_file_base.lower().endswith(f".{fmt}"):
-                    final_file_base += f".{fmt}"
-                dest = output_dir / final_file_base
-                src.rename(dest)
-                files = [dest]
-                print(f"[transactions] Renamed to: {dest}")
+            # Canonical wrapper
+            raw_list = raw_payload if isinstance(raw_payload, list) else []
+            canonical = [_canonicalize_george_transaction(tx) for tx in raw_list if isinstance(tx, dict)]
 
-            print(f"[transactions] Downloaded {len(files)} {fmt.upper()} files")
-            
-            # If JSON requested, ensure it is wrapped in canonical schema
-            # NOTE: The 'download_transactions' logic for JSON currently just saves whatever George gives.
-            # We should ideally wrap it if we want unification.
-            # For now, we trust the download. 
-            # TODO: Add wrapping logic here similar to elba.py if George JSON isn't already compatible.
-            
+            wrapper = {
+                "institution": "george",
+                "account": {"id": str(account.get("id") or ""), "iban": account.get("iban")},
+                "range": {"from": date_from, "until": date_until},
+                "fetchedAt": _now_iso_local(),
+                "transactions": canonical,
+            }
+            if DEBUG_ENABLED:
+                wrapper["raw"] = raw_payload
+                if raw_path:
+                    wrapper["rawPath"] = str(raw_path)
+
+            if fmt == "json":
+                out_file = out_base.with_suffix(".json")
+                out_file.write_text(json.dumps(wrapper, ensure_ascii=False, indent=2))
+                print(f"[transactions] Saved JSON: {out_file}", flush=True)
+            else:
+                # Simple CSV from canonical rows
+                import csv
+
+                out_file = out_base.with_suffix(".csv")
+                out_file.parent.mkdir(parents=True, exist_ok=True)
+                fieldnames = [
+                    "bookingDate",
+                    "amount",
+                    "currency",
+                    "counterparty",
+                    "description",
+                    "purpose",
+                    "bankReference",
+                ]
+                with out_file.open("w", newline="", encoding="utf-8") as f:
+                    w = csv.DictWriter(f, fieldnames=fieldnames)
+                    w.writeheader()
+                    for tx in canonical:
+                        amt = (tx.get("amount") or {}) if isinstance(tx.get("amount"), dict) else {}
+                        cp = (tx.get("counterparty") or {}) if isinstance(tx.get("counterparty"), dict) else {}
+                        refs = (tx.get("references") or {}) if isinstance(tx.get("references"), dict) else {}
+                        w.writerow(
+                            {
+                                "bookingDate": tx.get("bookingDate"),
+                                "amount": amt.get("amount"),
+                                "currency": amt.get("currency"),
+                                "counterparty": cp.get("name"),
+                                "description": tx.get("description"),
+                                "purpose": tx.get("purpose"),
+                                "bankReference": refs.get("bankReference"),
+                            }
+                        )
+                print(f"[transactions] Saved CSV: {out_file}", flush=True)
+
+            return 0
         finally:
             context.close()
 
-    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="George Banking Automation",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  george.py setup                                # Initial setup
+  george.py accounts                             # List accounts
+  george.py transactions --account main --from 2024-01-01 --until 2024-01-31
+        """
+    )
+    
+    # Global options
+    parser.add_argument("--visible", action="store_true", help="Show browser window")
+    parser.add_argument("--dir", default=None, help="State directory (default: ~/.moltbot/george; override via GEORGE_DIR)")
+    parser.add_argument("--login-timeout", type=int, default=DEFAULT_LOGIN_TIMEOUT, help="Seconds to wait for phone approval")
+    parser.add_argument("--user-id", default=None, help="Override George user number/username (or set GEORGE_USER_ID)")
+    parser.add_argument("--debug", action="store_true", help="Save bank-native payloads to <stateDir>/debug (default: off)")
+    
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # setup
+    setup_parser = subparsers.add_parser("setup", help="Setup user ID and install playwright")
+    setup_parser.add_argument("--user-id", help="George user ID (8-9 digit number)")
+    setup_parser.set_defaults(func=cmd_setup)
+
+    # login (standalone)
+    login_parser = subparsers.add_parser("login", help="Perform login only")
+    login_parser.set_defaults(func=cmd_login)
+
+    # logout (standalone)
+    logout_parser = subparsers.add_parser("logout", help="Clear session/profile")
+    logout_parser.set_defaults(func=cmd_logout)
+
+    # accounts
+    acc_parser = subparsers.add_parser("accounts", help="List available accounts")
+    acc_parser.add_argument("--fetch", action="store_true", help="Alias for default live fetch (updates config.json)")
+    acc_parser.add_argument("--no-fetch", action="store_true", help="List cached config only (no API call)")
+    acc_parser.add_argument("--json", action="store_true", help="Output canonical JSON")
+    acc_parser.set_defaults(func=cmd_accounts)
+
+    # balances
+    bal_parser = subparsers.add_parser("balances", help="List all accounts with balances (API)")
+    bal_parser.set_defaults(func=cmd_balances)
+
+    # statements
+    stmt_parser = subparsers.add_parser("statements", help="Download PDF statements")
+    stmt_parser.add_argument("-a", "--account", required=True, help="Account key/name/IBAN")
+    stmt_parser.add_argument("-y", "--year", type=int, required=True)
+    stmt_parser.add_argument("-q", "--quarter", type=int, required=True, choices=[1, 2, 3, 4])
+    stmt_parser.add_argument("-o", "--output", help="Output directory")
+    stmt_parser.add_argument("--no-receipts", action="store_true", help="Skip booking receipts")
+    stmt_parser.set_defaults(func=cmd_statements)
+    
+    # export (data export: CAMT53/MT940)
+    export_parser = subparsers.add_parser(
+        "export",
+        help="Download data exports (CAMT53/MT940)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    export_parser.add_argument("--type", default=DEFAULT_EXPORT_TYPE, choices=EXPORT_TYPES,
+                               help="Export type (default: camt53)")
+    export_parser.add_argument("-o", "--output", help="Output directory")
+    export_parser.set_defaults(func=cmd_export)
+
+    # datacarrier-upload
+    dc_upload_parser = subparsers.add_parser("datacarrier-upload", help="Upload a data-carrier file")
+    dc_upload_parser.add_argument("file", help="Data-carrier file path to upload")
+    dc_upload_parser.add_argument("--type", default="PACKAGE", help="Data-carrier type (default: PACKAGE)")
+    dc_upload_parser.add_argument("-o", "--output", help="Output directory for response JSON")
+    dc_upload_parser.add_argument("--wait-done", action="store_true", help="Poll until uploaded file state is DONE")
+    dc_upload_parser.set_defaults(func=cmd_datacarrier_upload)
+
+    # datacarrier-sign
+    dc_sign_parser = subparsers.add_parser("datacarrier-sign", help="Sign a data-carrier upload")
+    dc_sign_parser.add_argument("datacarrier_id", help="Data-carrier upload id to sign")
+    dc_sign_parser.add_argument("--sign-id", default=None, help="Optional signId")
+    dc_sign_parser.add_argument("--timeout", type=int, default=120, help="Polling timeout in seconds")
+    dc_sign_parser.add_argument("--poll", type=int, default=3, help="Polling interval in seconds")
+    dc_sign_parser.add_argument("-o", "--output", help="Output directory for response JSON")
+    dc_sign_parser.set_defaults(func=cmd_datacarrier_sign)
+
+    # transactions (primary transaction export command)
+    transactions_parser = subparsers.add_parser("transactions", help="Download transactions")
+    transactions_parser.add_argument("--account", required=True, help="Account key/name/IBAN")
+    transactions_parser.add_argument("--format", default="json", choices=["csv", "json"], help="Output format (default: json)")
+    transactions_parser.add_argument("--out", dest="output", help="Output file base or directory")
+    transactions_parser.add_argument("--from", dest="date_from", required=True, help="Start date (YYYY-MM-DD)")
+    transactions_parser.add_argument("--until", dest="date_until", required=True, help="End date (YYYY-MM-DD)")
+    transactions_parser.set_defaults(func=cmd_transactions)
+    
+    args = parser.parse_args()
+    _apply_state_dir(getattr(args, "dir", None))
+
+    global DEBUG_ENABLED
+    DEBUG_ENABLED = bool(getattr(args, "debug", False))
+
+    global USER_ID_OVERRIDE
+    USER_ID_OVERRIDE = getattr(args, "user_id", None)
+
+    return args.func(args)
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)
