@@ -237,9 +237,9 @@ def _canonical_account_type_george(raw_type: str | None) -> str:
         "giro": "checking",
         "saving": "savings",
         "savings": "savings",
-        "loan": "loan",
-        "credit": "credit",
-        "kredit": "credit",
+        "loan": "debt",
+        "credit": "debt",
+        "kredit": "debt",
         "creditcard": "creditcard",
     }.get(t, t or "other")
 

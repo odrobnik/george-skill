@@ -55,7 +55,7 @@ Notes:
   "accounts": [
     {
       "id": "string",                 // stable internal id (bank product id, depot id, etc)
-      "type": "checking"|"savings"|"loan"|"credit"|"creditcard"|"depot"|"other",
+      "type": "checking"|"savings"|"debt"|"creditcard"|"depot"|"other",
       "name": "string",
       "iban": "AT..." ,               // null for products without IBAN
       "currency": "EUR",
