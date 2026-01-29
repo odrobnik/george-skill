@@ -59,11 +59,18 @@ def _default_state_dir() -> Path:
     return Path.home() / ".moltbot" / "george"
 
 
+def _default_output_dir() -> Path:
+    # Ephemeral outputs (exports, PDFs, canonical JSON) go to /tmp by default.
+    # Override with MOLTBOT_TMP if you want a different temp root.
+    tmp_root = Path(os.environ.get("MOLTBOT_TMP", "/tmp")).expanduser().resolve()
+    return tmp_root / "moltbot" / "george"
+
+
 # Runtime state dir (override via --dir or GEORGE_DIR)
 STATE_DIR: Path = _default_state_dir()
 CONFIG_PATH: Path = STATE_DIR / "config.json"
 PROFILE_DIR: Path = STATE_DIR / ".pw-profile"
-DEFAULT_OUTPUT_DIR: Path = STATE_DIR / "data"
+DEFAULT_OUTPUT_DIR: Path = _default_output_dir()
 
 DEBUG_DIR: Path = STATE_DIR / "debug"
 TOKEN_CACHE_FILE: Path = PROFILE_DIR / "token.json"
@@ -157,7 +164,7 @@ def _apply_state_dir(dir_value: str | None) -> None:
 
     CONFIG_PATH = STATE_DIR / "config.json"
     PROFILE_DIR = STATE_DIR / ".pw-profile"
-    DEFAULT_OUTPUT_DIR = STATE_DIR / "data"
+    DEFAULT_OUTPUT_DIR = _default_output_dir()
 
     global DEBUG_DIR, TOKEN_CACHE_FILE
     DEBUG_DIR = STATE_DIR / "debug"
@@ -250,7 +257,7 @@ def canonicalize_accounts_george(payload, normalized: list[dict], raw_path: Path
     if isinstance(payload, list):
         raw_accounts = [x for x in payload if isinstance(x, dict)]
     elif isinstance(payload, dict):
-        for key in ("items", "accounts", "data", "content", "accountList"):
+        for key in ("items", "accounts", "collection", "data", "content", "accountList"):
             v = payload.get(key)
             if isinstance(v, list):
                 raw_accounts = [x for x in v if isinstance(x, dict)]
@@ -265,6 +272,13 @@ def canonicalize_accounts_george(payload, normalized: list[dict], raw_path: Path
     out_accounts = []
     for a in normalized:
         acc_id = str(a.get("id") or "")
+
+        # Filter out non-account products we don't want in canonical output (e.g. insurance).
+        raw_type = str(a.get("type") or "").lower()
+        canon_type = _canonical_account_type_george(a.get("type"))
+        if raw_type == "insurance" or canon_type == "insurance":
+            continue
+
         raw = by_id.get(acc_id) or {}
 
         bal_amt, bal_ccy = _extract_money_from_account(
@@ -282,17 +296,56 @@ def canonicalize_accounts_george(payload, normalized: list[dict], raw_path: Path
 
         currency = (a.get("currency") or bal_ccy or avail_ccy or "EUR").strip()
 
+        balances: dict = {}
+        if bal_amt is not None:
+            balances["booked"] = {"amount": bal_amt, "currency": currency}
+        if avail_amt is not None:
+            balances["available"] = {"amount": avail_amt, "currency": currency}
+
         acct = {
             "id": acc_id,
-            "type": _canonical_account_type_george(a.get("type")),
+            "type": canon_type,
             "name": a.get("name") or a.get("alias") or a.get("description") or "N/A",
-            "iban": a.get("iban"),
             "currency": currency,
-            "balances": {
-                "booked": {"amount": bal_amt, "currency": currency} if bal_amt is not None else None,
-                "available": {"amount": avail_amt, "currency": currency} if avail_amt is not None else None,
-            },
         }
+        # Omit "balances": null/empty from JSON
+        if balances:
+            acct["balances"] = balances
+
+        # Omit "iban": null from JSON
+        if a.get("iban"):
+            acct["iban"] = a.get("iban")
+
+        # Extra metadata (currently used for credit cards)
+        if isinstance(a.get("number"), str) and str(a.get("number")).strip():
+            acct["number"] = str(a.get("number")).strip()
+
+        if acct.get("type") == "creditcard":
+            # Prefer values embedded in the proxy accounts payload: raw['card']
+            card = raw.get("card") if isinstance(raw.get("card"), dict) else None
+            if card:
+                num = card.get("number")
+                if not acct.get("number") and isinstance(num, str) and num.strip():
+                    acct["number"] = num.strip()
+
+                bal_amt2 = _extract_amount(card.get("balance"))
+                bal_ccy2 = _extract_currency(card.get("balance")) or acct.get("currency")
+                if bal_amt2 is not None:
+                    acct["balances"]["booked"] = {"amount": bal_amt2, "currency": bal_ccy2}
+
+                lim_amt = _extract_amount(card.get("limit"))
+                lim_ccy = _extract_currency(card.get("limit")) or bal_ccy2 or acct.get("currency")
+                if lim_amt is not None:
+                    acct["limit"] = {"amount": lim_amt, "currency": lim_ccy}
+            else:
+                # Fallback: values from /my/cards merge (if present)
+                bal = a.get("balance") if isinstance(a.get("balance"), dict) else None
+                if isinstance(bal, dict) and bal.get("amount") is not None:
+                    acct["balances"]["booked"] = {"amount": bal.get("amount"), "currency": bal.get("currency") or acct.get("currency")}
+                lim = a.get("limit") if isinstance(a.get("limit"), dict) else None
+                if isinstance(lim, dict) and lim.get("amount") is not None:
+                    acct["limit"] = {"amount": lim.get("amount"), "currency": lim.get("currency") or acct.get("currency")}
+
         out_accounts.append(acct)
 
     return {
@@ -823,17 +876,126 @@ def capture_bearer_auth_header(context, page, timeout_s: int = 10) -> str | None
 
 
 def fetch_my_accounts(context, auth_header: str) -> dict:
-    url = "https://api.sparkasse.at/rest/netbanking/my/accounts"
+    """Fetch accounts for the current user.
+
+    George uses multiple backends; we've observed that the SPA calls:
+      https://api.sparkasse.at/proxy/g/api/my/accounts
+    which can include credit-card accounts.
+
+    We keep a fallback to the older REST endpoint.
+    """
+    urls = [
+        "https://api.sparkasse.at/proxy/g/api/my/accounts",
+        "https://api.sparkasse.at/rest/netbanking/my/accounts",
+    ]
+
+    last_err: Exception | None = None
+    for url in urls:
+        try:
+            resp = context.request.get(url, headers={"Authorization": auth_header}, timeout=30000)
+        except Exception as e:
+            last_err = e
+            continue
+
+        if resp and resp.ok:
+            return resp.json()
+
+        # keep trying fallbacks
+        last_err = RuntimeError(f"[accounts] API request failed (status={resp.status if resp else 'N/A'}) for {url}")
+
+    raise RuntimeError(f"[accounts] API request failed: {last_err}")
+
+
+def fetch_my_cards(context, auth_header: str) -> dict:
+    """Fetch all cards (debit + credit) for the current user.
+
+    Note: This endpoint returns *plastic cards* plus some credit-card metadata.
+    For credit cards, it includes a `creditCardShadowAccountId` that can be
+    combined with the card `id` to form the George credit-card "account" id:
+
+        <shadowAccountId>-<cardId>
+
+    This matches the dashboard route: /creditcard/<shadow>-<cardId>
+    """
+    url = "https://api.sparkasse.at/rest/netbanking/my/cards"
     try:
         resp = context.request.get(url, headers={"Authorization": auth_header}, timeout=30000)
     except Exception as e:
-        raise RuntimeError(f"[accounts] API request failed: {e}") from e
+        raise RuntimeError(f"[cards] API request failed: {e}") from e
 
     if not resp or not resp.ok:
         status = resp.status if resp else "N/A"
-        raise RuntimeError(f"[accounts] API request failed (status={status})")
+        raise RuntimeError(f"[cards] API request failed (status={status})")
 
     return resp.json()
+
+
+def normalize_creditcard_accounts_from_cards(payload) -> list[dict]:
+    """Convert /my/cards payload into synthetic George 'creditcard' accounts.
+
+    George exposes credit-card transactions under an account id of the form:
+      <creditCardShadowAccountId>-<cardId>
+
+    We store those as accounts so `george.py transactions --account <name>` works.
+    """
+    if not isinstance(payload, dict):
+        return []
+
+    cards = payload.get("cards")
+    if not isinstance(cards, list):
+        return []
+
+    out: list[dict] = []
+    for card in cards:
+        if not isinstance(card, dict):
+            continue
+
+        # Only credit cards have this mapping.
+        shadow = card.get("creditCardShadowAccountId")
+        card_id = card.get("id")
+        if not (isinstance(shadow, str) and shadow.strip() and isinstance(card_id, str) and card_id.strip()):
+            continue
+
+        cc_account_id = f"{shadow.strip()}-{card_id.strip()}"
+        name = card.get("productI18N") or card.get("product") or "Credit Card"
+
+        entry = {
+            "id": cc_account_id,
+            "type": "creditcard",
+            "name": str(name),
+            "iban": None,
+        }
+
+        # Card number (masked) for display (e.g. 530200XXXXXX1006)
+        num = card.get("number")
+        if isinstance(num, str) and num.strip():
+            entry["number"] = num.strip()
+
+        def money_obj(m):
+            if not isinstance(m, dict):
+                return None
+            v = m.get("value")
+            prec = m.get("precision")
+            cur = m.get("currency")
+            if isinstance(v, (int, float)) and isinstance(prec, int) and isinstance(cur, str) and cur.strip():
+                return {"amount": float(v) / (10 ** prec), "currency": cur.strip()}
+            return None
+
+        # Carry balance + limit (and currency hint)
+        bal = money_obj(card.get("balance"))
+        if bal:
+            entry["balance"] = bal
+            entry["currency"] = bal.get("currency")
+
+        limit = money_obj(card.get("limit"))
+        if limit:
+            entry["limit"] = limit
+            if "currency" not in entry and limit.get("currency"):
+                entry["currency"] = limit.get("currency")
+
+        out.append(entry)
+
+    return out
 
 
 def _extract_first(d: dict, keys: list[str]) -> object | None:
@@ -889,7 +1051,7 @@ def normalize_accounts_from_api(payload) -> list[dict]:
     if isinstance(payload, list):
         accounts = payload
     elif isinstance(payload, dict):
-        for key in ("items", "accounts", "data", "content", "accountList"):
+        for key in ("items", "accounts", "collection", "data", "content", "accountList"):
             v = payload.get(key)
             if isinstance(v, list):
                 accounts = v
@@ -909,6 +1071,33 @@ def normalize_accounts_from_api(payload) -> list[dict]:
         iban = _extract_first(acc, ["iban", "ibanNumber", "ibanFormatted"])
         currency = _extract_first(acc, ["currency", "ccy"])
 
+        # /proxy/g/api/my/accounts includes embedded `card` objects.
+        # Treat CREDIT cards as synthetic creditcard accounts (skip non-credit cards).
+        card = acc.get("card") if isinstance(acc.get("card"), dict) else None
+        card_number: str | None = None
+        if card:
+            card_type = (card.get("type") or "").lower()
+            flags = acc.get("flags") if isinstance(acc.get("flags"), list) else []
+            is_cc = (card_type == "credit") or ("CC" in flags)
+            if not is_cc:
+                continue
+
+            acc_type = "creditcard"
+            name = card.get("productI18N") or card.get("product") or name
+            num = card.get("number")
+            if isinstance(num, str) and num.strip():
+                card_number = num.strip()
+
+            # Prefer currency from card balance/limit if present.
+            if currency is None and isinstance(card.get("balance"), dict):
+                cur = card.get("balance", {}).get("currency")
+                if isinstance(cur, str) and cur.strip():
+                    currency = cur.strip()
+            if currency is None and isinstance(card.get("limit"), dict):
+                cur = card.get("limit", {}).get("currency")
+                if isinstance(cur, str) and cur.strip():
+                    currency = cur.strip()
+
         # George /my/accounts shape nests IBAN in accountno.iban
         if iban is None:
             accountno = acc.get("accountno") or acc.get("accountNo") or acc.get("accountNumber")
@@ -924,6 +1113,9 @@ def normalize_accounts_from_api(payload) -> list[dict]:
             "name": str(name) if name is not None else "",
             "iban": str(iban) if iban is not None else None,
         }
+
+        if card_number:
+            entry["number"] = card_number
 
         if currency:
             entry["currency"] = str(currency)
@@ -1860,14 +2052,18 @@ def cmd_accounts(args):
             page = context.new_page()
 
             try:
+                auth_header_value: str | None = None
+
                 # 1) Prefer cached token to avoid interactive login.
                 token_cache = _load_token_cache() or {}
                 token = token_cache.get("accessToken") if isinstance(token_cache, dict) else None
                 if isinstance(token, str) and token.strip():
                     try:
-                        raw_payload = fetch_my_accounts(context, f"Bearer {token.strip()}")
+                        auth_header_value = f"Bearer {token.strip()}"
+                        raw_payload = fetch_my_accounts(context, auth_header_value)
                     except Exception:
                         raw_payload = None
+                        auth_header_value = None
 
                 # 2) If token didn't work, do interactive login (phone approval) and capture auth.
                 if raw_payload is None:
@@ -1881,14 +2077,39 @@ def cmd_accounts(args):
                         print("[accounts] ERROR: Could not capture API Authorization header", flush=True)
                         return 1
 
-                    raw_payload = fetch_my_accounts(context, auth_header)
-                    tok = _extract_bearer_token(auth_header)
+                    auth_header_value = auth_header
+                    raw_payload = fetch_my_accounts(context, auth_header_value)
+                    tok = _extract_bearer_token(auth_header_value)
                     if tok:
                         _save_token_cache(tok, source="auth_header")
 
                 raw_path = _write_debug_json("my-accounts-raw", raw_payload)
 
                 normalized = normalize_accounts_from_api(raw_payload)
+
+                # Also fetch credit card metadata, so we can add CC 'shadow accounts' without scraping.
+                try:
+                    if auth_header_value:
+                        cards_payload = fetch_my_cards(context, auth_header_value)
+                        cc_accounts = normalize_creditcard_accounts_from_cards(cards_payload)
+                    else:
+                        cc_accounts = []
+                except Exception:
+                    cc_accounts = []
+
+                if cc_accounts:
+                    # Merge CC metadata into existing accounts if present; otherwise append.
+                    by_id = {str(a.get("id") or ""): a for a in normalized if str(a.get("id") or "").strip()}
+                    for acc in cc_accounts:
+                        acc_id = str(acc.get("id") or "").strip()
+                        if not acc_id:
+                            continue
+                        if acc_id in by_id:
+                            # Preserve existing name/iban/type unless missing; enrich with number/balance/limit.
+                            by_id[acc_id].update({k: v for k, v in acc.items() if v is not None})
+                        else:
+                            normalized.append(acc)
+                            by_id[acc_id] = acc
 
                 # Persist identity-only account list in config (stable mapping for later commands)
                 CONFIG["accounts"] = normalized
@@ -2592,8 +2813,9 @@ def cmd_transactions(args):
             p.parent.mkdir(parents=True, exist_ok=True)
             out_base = p
     else:
+        DEFAULT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         acct = (account.get("iban") or account.get("id") or "account").replace(" ", "")
-        out_base = Path(f"transactions_{acct}_{date_from}_{date_until}")
+        out_base = DEFAULT_OUTPUT_DIR / f"transactions_{acct}_{date_from}_{date_until}"
 
     print(f"[george] Fetching {fmt.upper()} for {account.get('name')} ({date_from} -> {date_until})", flush=True)
 
@@ -2654,7 +2876,19 @@ def cmd_transactions(args):
 
             # Canonical wrapper
             raw_list = raw_payload if isinstance(raw_payload, list) else []
-            canonical = [_canonicalize_george_transaction(tx) for tx in raw_list if isinstance(tx, dict)]
+            is_creditcard = "creditcard" in str(account.get("type") or "").lower()
+
+            canonical: list[dict] = []
+            for tx in raw_list:
+                if not isinstance(tx, dict):
+                    continue
+                c = _canonicalize_george_transaction(tx)
+
+                # Credit cards: keep default output lean; only include raw per-item payload when --debug.
+                if DEBUG_ENABLED and is_creditcard:
+                    c["raw"] = tx
+
+                canonical.append(c)
 
             wrapper = {
                 "institution": "george",
@@ -2664,9 +2898,12 @@ def cmd_transactions(args):
                 "transactions": canonical,
             }
             if DEBUG_ENABLED:
-                wrapper["raw"] = raw_payload
+                # Always write the bank-native payload to the debug folder (rawPath).
+                # For credit cards, keep the wrapper lean and rely on per-item raw + rawPath.
                 if raw_path:
                     wrapper["rawPath"] = str(raw_path)
+                if not is_creditcard:
+                    wrapper["raw"] = raw_payload
 
             if fmt == "json":
                 out_file = out_base.with_suffix(".json")
@@ -2718,8 +2955,7 @@ def main():
         description="George Banking Automation",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  george.py setup                                # Initial setup
+  george.py login                                # Login only
   george.py accounts                             # List accounts
   george.py transactions --account main --from 2024-01-01 --until 2024-01-31
         """
@@ -2734,68 +2970,18 @@ Examples:
     
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # setup
-    setup_parser = subparsers.add_parser("setup", help="Setup user ID and install playwright")
-    setup_parser.add_argument("--user-id", help="George user ID (8-9 digit number)")
-    setup_parser.set_defaults(func=cmd_setup)
-
-    # login (standalone)
     login_parser = subparsers.add_parser("login", help="Perform login only")
     login_parser.set_defaults(func=cmd_login)
 
-    # logout (standalone)
     logout_parser = subparsers.add_parser("logout", help="Clear session/profile")
     logout_parser.set_defaults(func=cmd_logout)
 
-    # accounts
     acc_parser = subparsers.add_parser("accounts", help="List available accounts")
     acc_parser.add_argument("--fetch", action="store_true", help="Alias for default live fetch (updates config.json)")
     acc_parser.add_argument("--no-fetch", action="store_true", help="List cached config only (no API call)")
     acc_parser.add_argument("--json", action="store_true", help="Output canonical JSON")
     acc_parser.set_defaults(func=cmd_accounts)
 
-    # balances
-    bal_parser = subparsers.add_parser("balances", help="List all accounts with balances (API)")
-    bal_parser.set_defaults(func=cmd_balances)
-
-    # statements
-    stmt_parser = subparsers.add_parser("statements", help="Download PDF statements")
-    stmt_parser.add_argument("-a", "--account", required=True, help="Account key/name/IBAN")
-    stmt_parser.add_argument("-y", "--year", type=int, required=True)
-    stmt_parser.add_argument("-q", "--quarter", type=int, required=True, choices=[1, 2, 3, 4])
-    stmt_parser.add_argument("-o", "--output", help="Output directory")
-    stmt_parser.add_argument("--no-receipts", action="store_true", help="Skip booking receipts")
-    stmt_parser.set_defaults(func=cmd_statements)
-    
-    # export (data export: CAMT53/MT940)
-    export_parser = subparsers.add_parser(
-        "export",
-        help="Download data exports (CAMT53/MT940)",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    export_parser.add_argument("--type", default=DEFAULT_EXPORT_TYPE, choices=EXPORT_TYPES,
-                               help="Export type (default: camt53)")
-    export_parser.add_argument("-o", "--output", help="Output directory")
-    export_parser.set_defaults(func=cmd_export)
-
-    # datacarrier-upload
-    dc_upload_parser = subparsers.add_parser("datacarrier-upload", help="Upload a data-carrier file")
-    dc_upload_parser.add_argument("file", help="Data-carrier file path to upload")
-    dc_upload_parser.add_argument("--type", default="PACKAGE", help="Data-carrier type (default: PACKAGE)")
-    dc_upload_parser.add_argument("-o", "--output", help="Output directory for response JSON")
-    dc_upload_parser.add_argument("--wait-done", action="store_true", help="Poll until uploaded file state is DONE")
-    dc_upload_parser.set_defaults(func=cmd_datacarrier_upload)
-
-    # datacarrier-sign
-    dc_sign_parser = subparsers.add_parser("datacarrier-sign", help="Sign a data-carrier upload")
-    dc_sign_parser.add_argument("datacarrier_id", help="Data-carrier upload id to sign")
-    dc_sign_parser.add_argument("--sign-id", default=None, help="Optional signId")
-    dc_sign_parser.add_argument("--timeout", type=int, default=120, help="Polling timeout in seconds")
-    dc_sign_parser.add_argument("--poll", type=int, default=3, help="Polling interval in seconds")
-    dc_sign_parser.add_argument("-o", "--output", help="Output directory for response JSON")
-    dc_sign_parser.set_defaults(func=cmd_datacarrier_sign)
-
-    # transactions (primary transaction export command)
     transactions_parser = subparsers.add_parser("transactions", help="Download transactions")
     transactions_parser.add_argument("--account", required=True, help="Account key/name/IBAN")
     transactions_parser.add_argument("--format", default="json", choices=["csv", "json"], help="Output format (default: json)")

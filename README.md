@@ -1,19 +1,16 @@
-# George (Moltbot Skill)
+# George Skill
 
-Banking automation for **George (Erste Bank / Sparkasse Austria)** using Playwright.
+Unified web automation for George (Erste/Sparkasse): login, logout, accounts, transactions.
 
-- **Main documentation:** `SKILL.md`
-- **CLI entry point:** `scripts/george.py`
-
-## Quick start
-
+## Usage
 ```bash
-python3 scripts/george.py setup
-python3 scripts/george.py accounts   # auto-fetches + stores accounts if empty
-python3 scripts/george.py balances
+python3 scripts/george.py login
+python3 scripts/george.py logout
+python3 scripts/george.py accounts
+python3 scripts/george.py transactions --account <id|iban> --from YYYY-MM-DD --until YYYY-MM-DD
 ```
 
-State is stored outside the repo:
-- `~/.moltbot/george/config.json`
-- `~/.moltbot/george/.pw-profile/`
-- `~/.moltbot/george/data/`
+## Notes
+- Playwright is required; login requires phone approval.
+- Session state stored in `~/.moltbot/george/` (override with `--dir`).
+- See `SKILL.md` for agent usage guidance.
