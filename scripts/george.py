@@ -280,10 +280,14 @@ def canonicalize_accounts_george(payload, normalized: list[dict], raw_path: Path
     for a in normalized:
         acc_id = str(a.get("id") or "")
 
-        # Filter out non-account products we don't want in canonical output (e.g. insurance).
+        # Filter out non-account products we don't want in canonical output (e.g. insurance, security placeholder).
         raw_type = str(a.get("type") or "").lower()
         canon_type = _canonical_account_type_george(a.get("type"))
         if raw_type == "insurance" or canon_type == "insurance":
+            continue
+        # George exposes a "security" pseudo-account (UUID) that is not a depot and has no transactions.
+        # We model real depots separately via /my/securities as type="depot".
+        if raw_type == "security" or canon_type == "security":
             continue
 
         raw = by_id.get(acc_id) or {}
