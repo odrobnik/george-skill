@@ -3085,7 +3085,8 @@ def _canonicalize_portfolio(securities_account: dict) -> dict:
         if mv_amt is not None and mv_ccy:
             pos["marketValue"] = {"amount": mv_amt, "currency": mv_ccy}
         if perf_amt is not None and perf_ccy:
-            perf_obj = {"amount": perf_amt, "currency": perf_ccy}
+            # Canonical schema expected by Banker: performance.absolute + performance.percent
+            perf_obj = {"absolute": {"amount": perf_amt, "currency": perf_ccy}}
             if isinstance(perf_pct, (int, float)):
                 perf_obj["percent"] = float(perf_pct)
             pos["performance"] = perf_obj
