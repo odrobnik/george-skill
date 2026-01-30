@@ -21,6 +21,7 @@ import os
 import re
 import subprocess
 import time
+import uuid
 from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit, parse_qsl
@@ -56,7 +57,9 @@ else:
         sys.exit(1)
 
 def _default_state_dir() -> Path:
-    return Path.home() / ".moltbot" / "george"
+    # Keep George state alongside the OpenClaw workspace.
+    # Default: ~/clawd/george (override via --dir or GEORGE_DIR)
+    return Path.home() / "clawd" / "george"
 
 
 def _default_output_dir() -> Path:
@@ -68,17 +71,22 @@ def _default_output_dir() -> Path:
 
 # Runtime state dir (override via --dir or GEORGE_DIR)
 STATE_DIR: Path = _default_state_dir()
-CONFIG_PATH: Path = STATE_DIR / "config.json"
-PROFILE_DIR: Path = STATE_DIR / ".pw-profile"
 DEFAULT_OUTPUT_DIR: Path = _default_output_dir()
 
 DEBUG_DIR: Path = STATE_DIR / "debug"
-TOKEN_CACHE_FILE: Path = PROFILE_DIR / "token.json"
 
 DEFAULT_LOGIN_TIMEOUT = 180  # seconds (George app approval window is ~3 minutes)
 
 # User id override for this run (set from CLI --user-id)
 USER_ID_OVERRIDE: str | None = None
+
+def _get_profile_dir(user_id: str) -> Path:
+    """Return profile directory for a specific user."""
+    safe_uid = re.sub(r"[^a-z0-9\._-]", "", user_id.lower())
+    return STATE_DIR / f".pw-profile-{safe_uid}"
+
+def _get_token_cache_file(user_id: str) -> Path:
+    return _get_profile_dir(user_id) / "token.json"
 
 # George URLs
 BASE_URL = "https://george.sparkasse.at"
@@ -154,7 +162,7 @@ def _safe_url_for_logs(url: str | None) -> str:
 
 def _apply_state_dir(dir_value: str | None) -> None:
     """Apply state dir override and recompute derived paths."""
-    global STATE_DIR, CONFIG_PATH, PROFILE_DIR, DEFAULT_OUTPUT_DIR
+    global STATE_DIR, DEFAULT_OUTPUT_DIR
 
     if dir_value:
         STATE_DIR = Path(dir_value).expanduser().resolve()
@@ -162,13 +170,10 @@ def _apply_state_dir(dir_value: str | None) -> None:
         env_dir = os.environ.get("GEORGE_DIR")
         STATE_DIR = Path(env_dir).expanduser().resolve() if env_dir else _default_state_dir()
 
-    CONFIG_PATH = STATE_DIR / "config.json"
-    PROFILE_DIR = STATE_DIR / ".pw-profile"
     DEFAULT_OUTPUT_DIR = _default_output_dir()
 
-    global DEBUG_DIR, TOKEN_CACHE_FILE
+    global DEBUG_DIR
     DEBUG_DIR = STATE_DIR / "debug"
-    TOKEN_CACHE_FILE = PROFILE_DIR / "token.json"
 
     # Load optional .env from the state dir.
     _load_dotenv(STATE_DIR / ".env")
@@ -197,25 +202,27 @@ def _write_debug_json(prefix: str, payload) -> Path | None:
     return out
 
 
-def _load_token_cache() -> dict | None:
+def _load_token_cache(user_id: str) -> dict | None:
     try:
-        if not TOKEN_CACHE_FILE.exists():
+        p = _get_token_cache_file(user_id)
+        if not p.exists():
             return None
-        return json.loads(TOKEN_CACHE_FILE.read_text())
+        return json.loads(p.read_text())
     except Exception:
         return None
 
 
-def _save_token_cache(access_token: str, source: str = "auth_header", expires_at: str | None = None) -> None:
+def _save_token_cache(user_id: str, access_token: str, source: str = "auth_header", expires_at: str | None = None) -> None:
     try:
-        _ensure_dir(TOKEN_CACHE_FILE.parent)
+        p = _get_token_cache_file(user_id)
+        _ensure_dir(p.parent)
         data = {
             "accessToken": access_token,
             "obtainedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "expiresAt": expires_at,
             "source": source,
         }
-        TOKEN_CACHE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+        p.write_text(json.dumps(data, ensure_ascii=False, indent=2))
     except Exception:
         return
 
@@ -331,6 +338,8 @@ def canonicalize_accounts_george(payload, normalized: list[dict], raw_path: Path
                 bal_amt2 = _extract_amount(card.get("balance"))
                 bal_ccy2 = _extract_currency(card.get("balance")) or acct.get("currency")
                 if bal_amt2 is not None:
+                    if "balances" not in acct:
+                        acct["balances"] = {}
                     acct["balances"]["booked"] = {"amount": bal_amt2, "currency": bal_ccy2}
 
                 lim_amt = _extract_amount(card.get("limit"))
@@ -341,6 +350,8 @@ def canonicalize_accounts_george(payload, normalized: list[dict], raw_path: Path
                 # Fallback: values from /my/cards merge (if present)
                 bal = a.get("balance") if isinstance(a.get("balance"), dict) else None
                 if isinstance(bal, dict) and bal.get("amount") is not None:
+                    if "balances" not in acct:
+                        acct["balances"] = {}
                     acct["balances"]["booked"] = {"amount": bal.get("amount"), "currency": bal.get("currency") or acct.get("currency")}
                 lim = a.get("limit") if isinstance(a.get("limit"), dict) else None
                 if isinstance(lim, dict) and lim.get("amount") is not None:
@@ -359,57 +370,16 @@ def _login_timeout(args) -> int:
     return getattr(args, "login_timeout", DEFAULT_LOGIN_TIMEOUT)
 
 def load_config() -> dict:
-    """Load configuration from JSON file.
+    """DEPRECATED: George no longer uses a local config.json/accounts cache.
 
-    Supports automatic migration from older formats.
+    Kept only for backward-compatibility with old code paths.
     """
-    if not CONFIG_PATH.exists():
-        print(f"ERROR: Config file not found at {CONFIG_PATH}")
-        print("Please create it with your 'user_id' and 'accounts'.")
-        sys.exit(1)
+    return {}
 
-    with open(CONFIG_PATH, "r") as f:
-        cfg = json.load(f)
-
-    # Normalize + migrate accounts structure.
-    # New format: accounts is a list of account dicts.
-    accs = cfg.get("accounts")
-    if accs is None:
-        cfg["accounts"] = []
-    elif isinstance(accs, dict):
-        # Old format: { key: {account...}, ... }
-        cfg["accounts"] = list(accs.values())
-    elif isinstance(accs, list):
-        pass
-    else:
-        raise ValueError("config.json: 'accounts' must be a list (preferred) or dict (legacy)")
-
-    # user_id can be string (preferred) or list (legacy-ish)
-    uid = cfg.get("user_id")
-    if isinstance(uid, list):
-        # Keep as-is; resolved later.
-        pass
-    elif uid is None:
-        # allowed; resolved later.
-        pass
-    elif not isinstance(uid, str):
-        raise ValueError("config.json: 'user_id' must be a string or a list of strings")
-
-    return cfg
 
 def save_config(config: dict) -> None:
-    """Write config to disk (creates parent dirs)."""
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Ensure accounts is always a list on disk.
-    accs = config.get("accounts")
-    if accs is None:
-        config["accounts"] = []
-    elif isinstance(accs, dict):
-        config["accounts"] = list(accs.values())
-
-    with open(CONFIG_PATH, "w") as f:
-        json.dump(config, f, indent=4, sort_keys=True)
+    """DEPRECATED: George no longer writes a local config.json/accounts cache."""
+    return
 
 
 _ACCOUNT_TYPE_PREFIX = {
@@ -523,12 +493,9 @@ def get_account(account_key: str) -> dict:
 
     If ambiguous, raises with candidates.
     """
-    global CONFIG
-    if CONFIG is None:
-        CONFIG = load_config()
-
-    accounts: list[dict] = CONFIG.get("accounts", []) or []
-    q = (account_key or "").strip().lower()
+    q = (account_key or "").strip()
+    # Config-less mode: caller must provide the internal account id.
+    return {"id": q, "name": q, "iban": None, "type": "unknown"}
 
     def iban_norm(s: str | None) -> str:
         return re.sub(r"\s+", "", (s or "")).lower()
@@ -741,12 +708,8 @@ def login(page, timeout_seconds: int = 300) -> bool:
     
     print(f"[login] Entering user ID...", flush=True)
     
-    global CONFIG
-    if CONFIG is None:
-        CONFIG = load_config()
-        
     try:
-        user_id = _resolve_user_id(argparse.Namespace(user_id=USER_ID_OVERRIDE), CONFIG)
+        user_id = _resolve_user_id(argparse.Namespace(user_id=USER_ID_OVERRIDE))
     except Exception as e:
         print(f"[login] ERROR: {e}")
         return False
@@ -830,7 +793,11 @@ def capture_bearer_auth_header(context, page, timeout_s: int = 10) -> str | None
             return
         try:
             url = request.url or ""
-            if not url.startswith("https://api.sparkasse.at/rest/netbanking/"):
+            # George uses multiple backends; tokens are sent to both netbanking and proxy/g APIs.
+            if not (
+                url.startswith("https://api.sparkasse.at/rest/netbanking/")
+                or url.startswith("https://api.sparkasse.at/proxy/g/api/")
+            ):
                 return
             headers = request.headers or {}
             auth = headers.get("authorization") or headers.get("Authorization")
@@ -1881,78 +1848,79 @@ def download_csv_transactions(page, account: dict, date_from: str = None, date_t
 
 def cmd_login(args):
     """Perform standalone login."""
+    try:
+        user_id = _resolve_user_id(args)
+    except Exception as e:
+        print(f"[login] ERROR: {e}")
+        return 1
+
+    profile_dir = _get_profile_dir(user_id)
+    print(f"[login] User: {user_id}", flush=True)
+
+    global USER_ID_OVERRIDE
+    USER_ID_OVERRIDE = user_id
+
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
-            user_data_dir=str(PROFILE_DIR),
+            user_data_dir=str(profile_dir),
             headless=not args.visible,
             viewport={"width": 1280, "height": 900},
         )
         page = context.new_page()
         try:
             if login(page, timeout_seconds=_login_timeout(args)):
-                print("[login] Success! Session saved.", flush=True)
+                print(f"[login] Success! Session saved to {profile_dir.name}", flush=True)
                 return 0
-            else:
-                return 1
+            return 1
         finally:
             context.close()
 
+
 def cmd_logout(args):
-    """Clear session profile."""
-    profile_dir = PROFILE_DIR
+    """Clear session/profile for the selected user."""
+    try:
+        user_id = _resolve_user_id(args)
+    except Exception as e:
+        print(f"[logout] ERROR: {e}")
+        return 1
+
+    profile_dir = _get_profile_dir(user_id)
     if profile_dir.exists():
         import shutil
         try:
             shutil.rmtree(profile_dir)
-            print(f"[logout] Removed profile at {profile_dir}", flush=True)
+            print(f"[logout] Removed profile for {user_id} at {profile_dir.name}", flush=True)
             return 0
         except Exception as e:
             print(f"[logout] Error removing profile: {e}", flush=True)
             return 1
-    else:
-        print("[logout] No session found.", flush=True)
-        return 0
+
+    print(f"[logout] No session found for {user_id}.", flush=True)
+    return 0
 
 
-def _resolve_user_id(args, config: dict) -> str:
-    """Resolve the George user_id.
+def _resolve_user_id(args) -> str:
+    """Resolve the George user id.
 
     Precedence:
-    1) --user-id
-    2) GEORGE_USER_ID from environment (optionally via state-dir .env)
-    3) config.json user_id (only if exactly one)
+    1) --user-id (explicit)
+    2) GEORGE_USER_ID from environment
 
-    If config has no user_id or more than one, raise with guidance.
+    Note: the state dir may provide a .env file (loaded by _apply_state_dir) that sets
+    GEORGE_USER_ID, but it never overrides an already-set environment variable.
     """
     if getattr(args, "user_id", None):
         return str(args.user_id).strip()
 
     env_uid = os.environ.get("GEORGE_USER_ID")
-    if env_uid:
+    if env_uid and env_uid.strip():
         return env_uid.strip()
 
-    uid = config.get("user_id")
-    if uid is None or uid == "":
-        raise ValueError(
-            "No user_id configured. Set one of:\n"
-            "- pass --user-id <your-user-number-or-username>\n"
-            "- set GEORGE_USER_ID (or put it in ~/.moltbot/george/.env)\n"
-            "- add user_id to config.json"
-        )
-
-    if isinstance(uid, str):
-        return uid.strip()
-
-    if isinstance(uid, list):
-        uids = [str(x).strip() for x in uid if str(x).strip()]
-        if len(uids) == 1:
-            return uids[0]
-        raise ValueError(
-            "Multiple user_id entries found in config.json.\n"
-            "Fix by keeping exactly one, or use --user-id / GEORGE_USER_ID to override."
-        )
-
-    raise ValueError("Invalid user_id in config.json")
+    raise ValueError(
+        "No user id configured. Provide one of:\n"
+        "- --user-id <your-user-number-or-username>\n"
+        "- set GEORGE_USER_ID (or put it in <stateDir>/.env)"
+    )
 
 
 def cmd_setup(args):
@@ -2026,100 +1994,90 @@ def cmd_setup(args):
 
 
 def cmd_accounts(args):
-    """List accounts (with balances/value) in a unified format."""
-    global CONFIG
-    if CONFIG is None:
-        CONFIG = load_config()
+    """List accounts for the selected user (live; no local config/cache)."""
+    try:
+        user_id = _resolve_user_id(args)
+    except Exception as e:
+        print(f"[accounts] ERROR: {e}")
+        return 1
 
-    cached_accounts: list[dict] = CONFIG.get("accounts", []) or []
-
-    do_fetch = not bool(getattr(args, "no_fetch", False))
-    if bool(getattr(args, "fetch", False)):
-        do_fetch = True
+    profile_dir = _get_profile_dir(user_id)
+    global USER_ID_OVERRIDE
+    USER_ID_OVERRIDE = user_id
 
     raw_payload = None
     raw_path = None
     normalized: list[dict] = []
 
-    if do_fetch:
-        print("[accounts] Fetching live accounts via George API...", flush=True)
-        with sync_playwright() as p:
-            context = p.chromium.launch_persistent_context(
-                user_data_dir=str(PROFILE_DIR),
-                headless=not args.visible,
-                viewport={"width": 1280, "height": 900},
-            )
-            page = context.new_page()
+    print(f"[accounts] Fetching live accounts for {user_id}...", flush=True)
+    with sync_playwright() as p:
+        context = p.chromium.launch_persistent_context(
+            user_data_dir=str(profile_dir),
+            headless=not args.visible,
+            viewport={"width": 1280, "height": 900},
+        )
+        page = context.new_page()
 
-            try:
-                auth_header_value: str | None = None
+        try:
+            auth_header_value: str | None = None
 
-                # 1) Prefer cached token to avoid interactive login.
-                token_cache = _load_token_cache() or {}
-                token = token_cache.get("accessToken") if isinstance(token_cache, dict) else None
-                if isinstance(token, str) and token.strip():
-                    try:
-                        auth_header_value = f"Bearer {token.strip()}"
-                        raw_payload = fetch_my_accounts(context, auth_header_value)
-                    except Exception:
-                        raw_payload = None
-                        auth_header_value = None
-
-                # 2) If token didn't work, do interactive login (phone approval) and capture auth.
-                if raw_payload is None:
-                    if not login(page, timeout_seconds=_login_timeout(args)):
-                        return 1
-
-                    dismiss_modals(page)
-
-                    auth_header = capture_bearer_auth_header(context, page, timeout_s=10)
-                    if not auth_header:
-                        print("[accounts] ERROR: Could not capture API Authorization header", flush=True)
-                        return 1
-
-                    auth_header_value = auth_header
-                    raw_payload = fetch_my_accounts(context, auth_header_value)
-                    tok = _extract_bearer_token(auth_header_value)
-                    if tok:
-                        _save_token_cache(tok, source="auth_header")
-
-                raw_path = _write_debug_json("my-accounts-raw", raw_payload)
-
-                normalized = normalize_accounts_from_api(raw_payload)
-
-                # Also fetch credit card metadata, so we can add CC 'shadow accounts' without scraping.
+            # 1) Prefer cached token to avoid interactive login.
+            token_cache = _load_token_cache(user_id) or {}
+            token = token_cache.get("accessToken") if isinstance(token_cache, dict) else None
+            if isinstance(token, str) and token.strip():
                 try:
-                    if auth_header_value:
-                        cards_payload = fetch_my_cards(context, auth_header_value)
-                        cc_accounts = normalize_creditcard_accounts_from_cards(cards_payload)
-                    else:
-                        cc_accounts = []
+                    auth_header_value = f"Bearer {token.strip()}"
+                    raw_payload = fetch_my_accounts(context, auth_header_value)
                 except Exception:
+                    raw_payload = None
+                    auth_header_value = None
+
+            # 2) If token didn't work, do interactive login (phone approval) and capture auth.
+            if raw_payload is None:
+                if not login(page, timeout_seconds=_login_timeout(args)):
+                    return 1
+
+                dismiss_modals(page)
+
+                auth_header = capture_bearer_auth_header(context, page, timeout_s=10)
+                if not auth_header:
+                    print("[accounts] ERROR: Could not capture API Authorization header", flush=True)
+                    return 1
+
+                auth_header_value = auth_header
+                raw_payload = fetch_my_accounts(context, auth_header_value)
+                tok = _extract_bearer_token(auth_header_value)
+                if tok:
+                    _save_token_cache(user_id, tok, source="auth_header")
+
+            raw_path = _write_debug_json("my-accounts-raw", raw_payload)
+
+            normalized = normalize_accounts_from_api(raw_payload)
+
+            # Also fetch credit card metadata, so we can add CC 'shadow accounts' without scraping.
+            try:
+                if auth_header_value:
+                    cards_payload = fetch_my_cards(context, auth_header_value)
+                    cc_accounts = normalize_creditcard_accounts_from_cards(cards_payload)
+                else:
                     cc_accounts = []
+            except Exception:
+                cc_accounts = []
 
-                if cc_accounts:
-                    # Merge CC metadata into existing accounts if present; otherwise append.
-                    by_id = {str(a.get("id") or ""): a for a in normalized if str(a.get("id") or "").strip()}
-                    for acc in cc_accounts:
-                        acc_id = str(acc.get("id") or "").strip()
-                        if not acc_id:
-                            continue
-                        if acc_id in by_id:
-                            # Preserve existing name/iban/type unless missing; enrich with number/balance/limit.
-                            by_id[acc_id].update({k: v for k, v in acc.items() if v is not None})
-                        else:
-                            normalized.append(acc)
-                            by_id[acc_id] = acc
+            if cc_accounts:
+                by_id = {str(a.get("id") or ""): a for a in normalized if str(a.get("id") or "").strip()}
+                for acc in cc_accounts:
+                    acc_id = str(acc.get("id") or "").strip()
+                    if not acc_id:
+                        continue
+                    if acc_id in by_id:
+                        by_id[acc_id].update({k: v for k, v in acc.items() if v is not None})
+                    else:
+                        normalized.append(acc)
+                        by_id[acc_id] = acc
 
-                # Persist identity-only account list in config (stable mapping for later commands)
-                CONFIG["accounts"] = normalized
-                save_config(CONFIG)
-
-            finally:
-                context.close()
-
-    else:
-        normalized = cached_accounts
+        finally:
+            context.close()
 
     if not normalized:
         if getattr(args, "json", False):
@@ -2140,22 +2098,7 @@ def cmd_accounts(args):
         iban_short = _short_iban(acc.get("iban"))
         typ = acc.get("type") or "other"
 
-        balances = acc.get("balances") if isinstance(acc.get("balances"), dict) else {}
-        booked = balances.get("booked") if isinstance(balances, dict) else None
-        available = balances.get("available") if isinstance(balances, dict) else None
-
-        booked_s = "N/A"
-        avail_s = None
-        cur = acc.get("currency") or "EUR"
-        if isinstance(booked, dict) and booked.get("amount") is not None:
-            booked_s = f"{_eu_amount(float(booked['amount']))} {cur}"
-        if isinstance(available, dict) and available.get("amount") is not None:
-            avail_s = f"{_eu_amount(float(available['amount']))} {cur}"
-
-        if avail_s and avail_s != booked_s:
-            print(f"- {name} — {iban_short} — {booked_s} (avail {avail_s}) — {typ}", flush=True)
-        else:
-            print(f"- {name} — {iban_short} — {booked_s} — {typ}", flush=True)
+        print(f"- {name} — {iban_short} — id={acc.get('id')} — {typ}", flush=True)
 
     if wrapper.get("rawPath"):
         print(f"[accounts] raw payload saved: {wrapper['rawPath']}", flush=True)
@@ -2166,9 +2109,19 @@ def cmd_accounts(args):
 
 def cmd_balances(args):
     """List all accounts and their balances from the George overview."""
+    try:
+        user_id = _resolve_user_id(args)
+    except Exception as e:
+        print(f"[balances] ERROR: {e}")
+        return 1
+
+    profile_dir = _get_profile_dir(user_id)
+    global USER_ID_OVERRIDE
+    USER_ID_OVERRIDE = user_id
+
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
-            user_data_dir=str(PROFILE_DIR),
+            user_data_dir=str(profile_dir),
             headless=not args.visible,
             viewport={"width": 1280, "height": 900},
         )
@@ -2183,6 +2136,11 @@ def cmd_balances(args):
             if not auth_header:
                 print("[balances] ERROR: Could not capture API Authorization header", flush=True)
                 return 1
+            
+            # Save token
+            tok = _extract_bearer_token(auth_header)
+            if tok:
+                _save_token_cache(user_id, tok, source="auth_header")
 
             payload = fetch_my_accounts(context, auth_header)
             accounts = normalize_accounts_from_api(payload)
@@ -2239,6 +2197,19 @@ def cmd_balances(args):
 def cmd_statements(args):
     """Download PDF statements for an account."""
     account = get_account(args.account)
+    
+    # Determine user from account owner or fallback to default/args
+    user_id = account.get("owner")
+    if not user_id:
+        # Fallback to current default resolution
+        global CONFIG
+        if CONFIG is None: CONFIG = load_config()
+        user_id = _resolve_user_id(args, CONFIG)
+
+    profile_dir = _get_profile_dir(user_id)
+    global USER_ID_OVERRIDE
+    USER_ID_OVERRIDE = user_id
+
     output_dir = Path(args.output) if args.output else DEFAULT_OUTPUT_DIR / f"{args.year}-Q{args.quarter}"
     output_dir.mkdir(parents=True, exist_ok=True)
     
@@ -2248,11 +2219,11 @@ def cmd_statements(args):
     else:
         raise NotImplementedError(f"Q{args.quarter} statement mapping not yet validated")
     
-    print(f"[george] Downloading Q{args.quarter}/{args.year} statements for {account['name']}")
+    print(f"[george] Downloading Q{args.quarter}/{args.year} statements for {account['name']} (User: {user_id})")
     
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
-            user_data_dir=str(PROFILE_DIR),
+            user_data_dir=str(profile_dir),
             headless=not args.visible,
             accept_downloads=True,
             downloads_path=str(output_dir),
@@ -2281,6 +2252,16 @@ def cmd_statements(args):
 
 def cmd_export(args):
     """Download data exports (CAMT53/MT940) for all available accounts."""
+    try:
+        user_id = _resolve_user_id(args)
+    except Exception as e:
+        print(f"[export] ERROR: {e}")
+        return 1
+        
+    profile_dir = _get_profile_dir(user_id)
+    global USER_ID_OVERRIDE
+    USER_ID_OVERRIDE = user_id
+
     output_dir = Path(args.output) if args.output else DEFAULT_OUTPUT_DIR / "exports"
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2291,7 +2272,7 @@ def cmd_export(args):
 
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
-            user_data_dir=str(PROFILE_DIR),
+            user_data_dir=str(profile_dir),
             headless=not args.visible,
             accept_downloads=True,
             downloads_path=str(output_dir),
@@ -2316,6 +2297,16 @@ def cmd_export(args):
 
 def cmd_datacarrier_upload(args):
     """Upload a data-carrier file."""
+    try:
+        user_id = _resolve_user_id(args)
+    except Exception as e:
+        print(f"[datacarrier-upload] ERROR: {e}")
+        return 1
+        
+    profile_dir = _get_profile_dir(user_id)
+    global USER_ID_OVERRIDE
+    USER_ID_OVERRIDE = user_id
+
     file_path = Path(args.file).expanduser()
     if not file_path.exists() or not file_path.is_file():
         print(f"[datacarrier-upload] ERROR: File not found: {file_path}", flush=True)
@@ -2327,7 +2318,7 @@ def cmd_datacarrier_upload(args):
 
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
-            user_data_dir=str(PROFILE_DIR),
+            user_data_dir=str(profile_dir),
             headless=not args.visible,
             viewport={"width": 1280, "height": 900},
         )
@@ -2401,6 +2392,16 @@ def cmd_datacarrier_upload(args):
 
 def cmd_datacarrier_sign(args):
     """Sign a data-carrier upload."""
+    try:
+        user_id = _resolve_user_id(args)
+    except Exception as e:
+        print(f"[datacarrier-sign] ERROR: {e}")
+        return 1
+        
+    profile_dir = _get_profile_dir(user_id)
+    global USER_ID_OVERRIDE
+    USER_ID_OVERRIDE = user_id
+
     datacarrier_id = args.datacarrier_id
     output_dir = Path(args.output) if args.output else None
     if output_dir:
@@ -2408,7 +2409,7 @@ def cmd_datacarrier_sign(args):
 
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
-            user_data_dir=str(PROFILE_DIR),
+            user_data_dir=str(profile_dir),
             headless=not args.visible,
             viewport={"width": 1280, "height": 900},
         )
@@ -2706,12 +2707,29 @@ def _canonicalize_george_transaction(tx: dict) -> dict:
 
     # dates
     booking = tx.get("booking")
+    if booking is None:
+        booking = tx.get("bookingDate") # Paged API
+    
     if isinstance(booking, str) and len(booking) >= 10:
         out["bookingDate"] = booking[:10]
+    elif isinstance(booking, (int, float)):
+        # Timestamp in ms
+        try:
+            out["bookingDate"] = datetime.fromtimestamp(booking / 1000.0).strftime("%Y-%m-%d")
+        except Exception:
+            pass
 
     valuation = tx.get("valuation") or tx.get("valueDate")
+    if valuation is None:
+        valuation = tx.get("valuationDate") # Paged API
+
     if isinstance(valuation, str) and len(valuation) >= 10:
         out["valueDate"] = valuation[:10]
+    elif isinstance(valuation, (int, float)):
+        try:
+            out["valueDate"] = datetime.fromtimestamp(valuation / 1000.0).strftime("%Y-%m-%d")
+        except Exception:
+            pass
 
     # amount
     amount_obj = tx.get("amount")
@@ -2724,7 +2742,36 @@ def _canonicalize_george_transaction(tx: dict) -> dict:
 
     # counterparty
     cp_name = tx.get("partnerName") or tx.get("receiver") or tx.get("receiverName")
-    partner_account = tx.get("partnerAccount") if isinstance(tx.get("partnerAccount"), dict) else None
+    
+    # Paged API often has 'sender'/'receiver' objects.
+    # Determine which is the counterparty based on account ownership or direction?
+    # Actually, paged API often has 'partnerName', 'partner' object.
+    # In the example: partnerName is null, but senderName/receiverName exist.
+    # And there is a 'partner' object.
+    
+    if not cp_name:
+        # Paged API fallback
+        p = tx.get("partner")
+        if isinstance(p, dict):
+            # partner object might be empty or have fields
+            pass
+        # Try sender/receiver names if partnerName is missing
+        # We don't know "our" account ID easily here without context, but usually
+        # export.json provides 'partnerName'.
+        # Paged API has 'orderRole' (SENDER/RECEIVER). 
+        # If orderRole == SENDER, we are sender -> partner is receiver.
+        # If orderRole == RECEIVER, we are receiver -> partner is sender.
+        role = tx.get("orderRole")
+        if role == "SENDER":
+            cp_name = tx.get("receiverName")
+        elif role == "RECEIVER":
+            cp_name = tx.get("senderName")
+
+    partner_account = tx.get("partnerAccount") 
+    if partner_account is None:
+        # Paged API has 'partner' object with iban/bic
+        partner_account = tx.get("partner")
+
     cp: dict = {}
     if isinstance(cp_name, str) and cp_name.strip():
         cp["name"] = cp_name.strip()
@@ -2779,14 +2826,102 @@ def _canonicalize_george_transaction(tx: dict) -> dict:
     return out
 
 
+def fetch_transactions_paged(context, access_token: str, account_id: str, date_from: str, date_to: str) -> list[dict]:
+    """Fetch transactions via paged API (for older history)."""
+    base_url = "https://api.sparkasse.at/proxy/g/api/my/transactions"
+    headers = {
+        "Accept": "*/*",
+        "Accept-Language": "en",
+        "Authorization": f"Bearer {access_token}",
+        "x-request-id": str(uuid.uuid4()),
+        "Priority": "u=3, i",
+    }
+    
+    all_items = []
+    page = 0
+    page_size = 50
+    
+    print(f"[paged-fetch] Starting fetch for {account_id} ({date_from} to {date_to})...", flush=True)
+    
+    while True:
+        params = {
+            "continuousCardIdFiltering": "false",
+            "from": date_from,
+            "to": date_to,
+            "id": account_id,
+            "includeContainedTransactions": "true",
+            "page": str(page),
+            "pageSize": str(page_size),
+            "sum": "true",
+            "sumWithRoundup": "true",
+            "count": "true",
+            "balance": "false",
+            "includeProducts": "false"
+        }
+        
+        url_params = "&".join(f"{k}={v}" for k, v in params.items())
+        url = f"{base_url}?{url_params}"
+        
+        print(f"[paged-fetch] DEBUG URL: {url}", flush=True)
+
+        try:
+            resp = context.request.get(url, headers=headers, timeout=60000)
+        except Exception as e:
+            raise RuntimeError(f"[paged-fetch] Request failed (page {page}): {e}") from e
+            
+        if not resp.ok:
+            raise RuntimeError(f"[paged-fetch] API error {resp.status} on page {page}")
+            
+        data = resp.json()
+        collection = data.get("collection", [])
+        
+        if not collection:
+            break
+            
+        all_items.extend(collection)
+        print(f"[paged-fetch] Page {page}: fetched {len(collection)} items (total {len(all_items)})", flush=True)
+        
+        if len(collection) < page_size:
+            break
+            
+        page += 1
+        time.sleep(0.2) # be nice
+        
+    return all_items
+
+
 def cmd_transactions(args):
-    """Download transactions for an account (API-based, unified UX)."""
-    account = get_account(args.account)
+    """Download transactions for an account id (API-based).
+
+    No local account config/cache is used. Pass the George internal account id via --account.
+    """
+    account_id = str(args.account or "").strip()
+    if not account_id:
+        print("[transactions] ERROR: --account is required")
+        return 1
+
+    # User selection:
+    # - --user-id overrides everything
+    # - otherwise GEORGE_USER_ID (from env or <stateDir>/.env)
+    try:
+        user_id = _resolve_user_id(args)
+    except Exception as e:
+        print(f"[transactions] ERROR: {e}")
+        return 1
+
+    profile_dir = _get_profile_dir(user_id)
+    global USER_ID_OVERRIDE
+    USER_ID_OVERRIDE = user_id
+
+    # Minimal account descriptor for output
+    account = {"id": account_id, "iban": None, "name": account_id, "type": "unknown"}
 
     fmt = args.format.lower()
     if fmt not in TRANSACTION_EXPORT_FORMATS:
         print(f"[transactions] Invalid format '{fmt}'. Supported: {', '.join(TRANSACTION_EXPORT_FORMATS)}")
         return 1
+    
+    method = getattr(args, "method", "export") # export (default) or paging
 
     # Validate ISO dates
     from datetime import datetime
@@ -2817,30 +2952,42 @@ def cmd_transactions(args):
         acct = (account.get("iban") or account.get("id") or "account").replace(" ", "")
         out_base = DEFAULT_OUTPUT_DIR / f"transactions_{acct}_{date_from}_{date_until}"
 
-    print(f"[george] Fetching {fmt.upper()} for {account.get('name')} ({date_from} -> {date_until})", flush=True)
+    print(f"[george] Fetching {fmt.upper()} for {account.get('name')} ({date_from} -> {date_until}) (User: {user_id}, Method: {method})", flush=True)
 
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
-            user_data_dir=str(PROFILE_DIR),
+            user_data_dir=str(profile_dir),
             headless=not args.visible,
             viewport={"width": 1280, "height": 900},
         )
         page = context.new_page()
         try:
             # Token reuse -> avoid interactive login when possible
-            token_cache = _load_token_cache() or {}
+            token_cache = _load_token_cache(user_id) or {}
             token = token_cache.get("accessToken") if isinstance(token_cache, dict) else None
             raw_payload = None
 
-            if isinstance(token, str) and token.strip():
-                try:
-                    raw_payload = fetch_transactions_export(
+            def _do_fetch(t):
+                if method == "paging":
+                    return fetch_transactions_paged(
                         context,
-                        token.strip(),
+                        t,
                         str(account.get("id") or ""),
                         date_from,
                         date_until,
                     )
+                else:
+                    return fetch_transactions_export(
+                        context,
+                        t,
+                        str(account.get("id") or ""),
+                        date_from,
+                        date_until,
+                    )
+
+            if isinstance(token, str) and token.strip():
+                try:
+                    raw_payload = _do_fetch(token.strip())
                 except Exception:
                     raw_payload = None
 
@@ -2859,14 +3006,8 @@ def cmd_transactions(args):
                     print("[transactions] ERROR: Could not extract bearer token", flush=True)
                     return 1
 
-                _save_token_cache(tok, source="auth_header")
-                raw_payload = fetch_transactions_export(
-                    context,
-                    tok,
-                    str(account.get("id") or ""),
-                    date_from,
-                    date_until,
-                )
+                _save_token_cache(user_id, tok, source="auth_header")
+                raw_payload = _do_fetch(tok)
 
             # Debug raw
             raw_path = _write_debug_json(
@@ -2957,13 +3098,13 @@ def main():
         epilog="""
   george.py login                                # Login only
   george.py accounts                             # List accounts
-  george.py transactions --account main --from 2024-01-01 --until 2024-01-31
+  george.py transactions --account <ACCOUNT_ID> --from 2024-01-01 --until 2024-01-31 [--method paging]
         """
     )
     
     # Global options
     parser.add_argument("--visible", action="store_true", help="Show browser window")
-    parser.add_argument("--dir", default=None, help="State directory (default: ~/.moltbot/george; override via GEORGE_DIR)")
+    parser.add_argument("--dir", default=None, help="State directory (default: ~/clawd/george; override via GEORGE_DIR)")
     parser.add_argument("--login-timeout", type=int, default=DEFAULT_LOGIN_TIMEOUT, help="Seconds to wait for phone approval")
     parser.add_argument("--user-id", default=None, help="Override George user number/username (or set GEORGE_USER_ID)")
     parser.add_argument("--debug", action="store_true", help="Save bank-native payloads to <stateDir>/debug (default: off)")
@@ -2976,15 +3117,14 @@ def main():
     logout_parser = subparsers.add_parser("logout", help="Clear session/profile")
     logout_parser.set_defaults(func=cmd_logout)
 
-    acc_parser = subparsers.add_parser("accounts", help="List available accounts")
-    acc_parser.add_argument("--fetch", action="store_true", help="Alias for default live fetch (updates config.json)")
-    acc_parser.add_argument("--no-fetch", action="store_true", help="List cached config only (no API call)")
+    acc_parser = subparsers.add_parser("accounts", help="List available accounts (live)")
     acc_parser.add_argument("--json", action="store_true", help="Output canonical JSON")
     acc_parser.set_defaults(func=cmd_accounts)
 
     transactions_parser = subparsers.add_parser("transactions", help="Download transactions")
-    transactions_parser.add_argument("--account", required=True, help="Account key/name/IBAN")
+    transactions_parser.add_argument("--account", required=True, help="Account id (use 'accounts' to list)")
     transactions_parser.add_argument("--format", default="json", choices=["csv", "json"], help="Output format (default: json)")
+    transactions_parser.add_argument("--method", default="export", choices=["export", "paging"], help="Fetch method (default: export)")
     transactions_parser.add_argument("--out", dest="output", help="Output file base or directory")
     transactions_parser.add_argument("--from", dest="date_from", required=True, help="Start date (YYYY-MM-DD)")
     transactions_parser.add_argument("--until", dest="date_until", required=True, help="End date (YYYY-MM-DD)")
