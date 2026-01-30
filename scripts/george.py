@@ -357,6 +357,20 @@ def canonicalize_accounts_george(payload, normalized: list[dict], raw_path: Path
                 if isinstance(lim, dict) and lim.get("amount") is not None:
                     acct["limit"] = {"amount": lim.get("amount"), "currency": lim.get("currency") or acct.get("currency")}
 
+        if acct.get("type") == "depot":
+            settlement = a.get("settlementAccount")
+            if isinstance(settlement, dict):
+                iban = settlement.get("iban")
+                if isinstance(iban, str) and iban.strip():
+                    acct["settlementAccount"] = {"iban": iban.strip()}
+                    cur = settlement.get("currency")
+                    if isinstance(cur, str) and cur.strip():
+                        acct["settlementAccount"]["currency"] = cur.strip()
+
+            securities = a.get("securities")
+            if isinstance(securities, dict) and securities:
+                acct["securities"] = securities
+
         out_accounts.append(acct)
 
     return {
@@ -797,6 +811,7 @@ def capture_bearer_auth_header(context, page, timeout_s: int = 10) -> str | None
             if not (
                 url.startswith("https://api.sparkasse.at/rest/netbanking/")
                 or url.startswith("https://api.sparkasse.at/proxy/g/api/")
+                or url.startswith("https://api.sparkasse.at/sec-trading/")
             ):
                 return
             headers = request.headers or {}
@@ -897,6 +912,46 @@ def fetch_my_cards(context, auth_header: str) -> dict:
     return resp.json()
 
 
+def fetch_my_securities(context, auth_header: str) -> dict:
+    """Fetch securities (depot) accounts list."""
+    url = "https://api.sparkasse.at/rest/netbanking/my/securities"
+    headers = {
+        "Authorization": auth_header,
+        "Accept": "application/vnd.at.sitsolutions.services.sec.account.representation.securities.account.list.v3+json",
+        "Accept-Language": "en",
+    }
+    try:
+        resp = context.request.get(url, headers=headers, timeout=30000)
+    except Exception as e:
+        raise RuntimeError(f"[securities] API request failed: {e}") from e
+
+    if not resp or not resp.ok:
+        status = resp.status if resp else "N/A"
+        raise RuntimeError(f"[securities] API request failed (status={status})")
+
+    return resp.json()
+
+
+def fetch_my_securities_account(context, auth_header: str, account_id: str) -> dict:
+    """Fetch securities (depot) account details, including holdings."""
+    url = f"https://api.sparkasse.at/rest/netbanking/my/securities/{account_id}"
+    headers = {
+        "Authorization": auth_header,
+        "Accept": "application/vnd.at.sitsolutions.services.sec.account.representation.securities.account.v3+json",
+        "Accept-Language": "en",
+    }
+    try:
+        resp = context.request.get(url, headers=headers, timeout=30000)
+    except Exception as e:
+        raise RuntimeError(f"[securities] API request failed: {e}") from e
+
+    if not resp or not resp.ok:
+        status = resp.status if resp else "N/A"
+        raise RuntimeError(f"[securities] API request failed (status={status})")
+
+    return resp.json()
+
+
 def normalize_creditcard_accounts_from_cards(payload) -> list[dict]:
     """Convert /my/cards payload into synthetic George 'creditcard' accounts.
 
@@ -965,6 +1020,75 @@ def normalize_creditcard_accounts_from_cards(payload) -> list[dict]:
     return out
 
 
+def _securities_accounts_list(payload) -> list[dict]:
+    if payload is None:
+        return []
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+    if isinstance(payload, dict):
+        for key in ("securitiesAccounts", "items", "accounts", "collection", "data", "content"):
+            v = payload.get(key)
+            if isinstance(v, list):
+                return [x for x in v if isinstance(x, dict)]
+        return [payload] if payload else []
+    return []
+
+
+def _find_securities_account(payload, account_id: str) -> dict | None:
+    if not account_id:
+        return None
+    for acc in _securities_accounts_list(payload):
+        acc_id = acc.get("id") or acc.get("accountId") or acc.get("uid") or acc.get("uuid")
+        if acc_id is not None and str(acc_id) == str(account_id):
+            return acc
+    return None
+
+
+def _collect_titles_from_securities_account(account: dict) -> list[dict]:
+    titles: list[dict] = []
+    sub = account.get("subSecAccounts")
+    if isinstance(sub, list):
+        for sub_acc in sub:
+            if not isinstance(sub_acc, dict):
+                continue
+            t = sub_acc.get("titles")
+            if isinstance(t, list):
+                titles.extend([x for x in t if isinstance(x, dict)])
+    return titles
+
+
+def normalize_depot_accounts_from_securities(payload) -> list[dict]:
+    accounts = _securities_accounts_list(payload)
+    out: list[dict] = []
+    for acc in accounts:
+        acc_id = _extract_first(acc, ["id", "accountId", "uid", "uuid"])
+        name = _extract_first(acc, ["description", "name", "productI18N", "productName"])
+        accountno = _extract_first(acc, ["accountno", "accountNo", "accountNumber"])
+        settlement = acc.get("settlementAccount") if isinstance(acc.get("settlementAccount"), dict) else None
+
+        titles = _collect_titles_from_securities_account(acc)
+        securities_summary = _sum_securities_titles(titles) if titles else {}
+
+        entry = {
+            "id": str(acc_id) if acc_id is not None else "",
+            "type": "depot",
+            "name": str(name) if name is not None else "Depot",
+            "iban": str(accountno) if isinstance(accountno, (str, int)) else None,
+            "currency": "EUR",
+        }
+        if settlement and isinstance(settlement.get("iban"), str) and settlement.get("iban").strip():
+            entry["settlementAccount"] = {"iban": settlement.get("iban").strip()}
+            if isinstance(settlement.get("currency"), str) and settlement.get("currency").strip():
+                entry["settlementAccount"]["currency"] = settlement.get("currency").strip()
+
+        if securities_summary:
+            entry["securities"] = securities_summary
+
+        out.append(entry)
+
+    return out
+
+
 def _extract_first(d: dict, keys: list[str]) -> object | None:
     for k in keys:
         if k in d and d.get(k) is not None:
@@ -1008,6 +1132,62 @@ def _extract_currency(value) -> str | None:
             if isinstance(v, str) and v.strip():
                 return v.strip()
     return None
+
+
+def _extract_money(value) -> tuple[float | None, str | None]:
+    amount = _extract_amount(value)
+    currency = _extract_currency(value)
+    if isinstance(currency, str):
+        currency = currency.strip()
+    return amount, currency
+
+
+def _sum_securities_titles(titles: list[dict]) -> dict:
+    total_value = 0.0
+    total_perf = 0.0
+    value_ccy = None
+    perf_ccy = None
+
+    weighted_pct_sum = 0.0
+    weighted_pct_weight = 0.0
+
+    for title in titles:
+        if not isinstance(title, dict):
+            continue
+
+        mv_amt, mv_ccy = _extract_money(title.get("marketValue"))
+        if mv_amt is not None and mv_ccy:
+            if value_ccy is None:
+                value_ccy = mv_ccy
+            if mv_ccy == value_ccy:
+                total_value += mv_amt
+
+        perf_amt, perf_ccy_val = _extract_money(title.get("performance"))
+        if perf_amt is not None and perf_ccy_val:
+            if perf_ccy is None:
+                perf_ccy = perf_ccy_val
+            if perf_ccy_val == perf_ccy:
+                total_perf += perf_amt
+
+        pct = title.get("performancePercent")
+        if pct is None:
+            pct = title.get("performancePercentInclFees") or title.get("performancePercentExclFees")
+        if isinstance(pct, (int, float)) and mv_amt is not None and mv_amt != 0:
+            weighted_pct_sum += float(pct) * abs(mv_amt)
+            weighted_pct_weight += abs(mv_amt)
+
+    out: dict = {}
+    if value_ccy is None:
+        value_ccy = perf_ccy
+    if total_value or (value_ccy is not None and total_value == 0.0):
+        out["value"] = {"amount": total_value, "currency": value_ccy or "EUR"}
+    if total_perf or (perf_ccy is not None and total_perf == 0.0):
+        profit = {"amount": total_perf, "currency": perf_ccy or value_ccy or "EUR"}
+        if weighted_pct_weight > 0:
+            profit["percent"] = weighted_pct_sum / weighted_pct_weight
+        out["profitLoss"] = profit
+
+    return out
 
 
 def normalize_accounts_from_api(payload) -> list[dict]:
@@ -2076,6 +2256,29 @@ def cmd_accounts(args):
                         normalized.append(acc)
                         by_id[acc_id] = acc
 
+            # Fetch securities (depot) accounts and merge.
+            securities_payload = None
+            if auth_header_value:
+                try:
+                    securities_payload = fetch_my_securities(context, auth_header_value)
+                except Exception:
+                    securities_payload = None
+
+            if securities_payload:
+                _write_debug_json("my-securities-raw", securities_payload)
+                depot_accounts = normalize_depot_accounts_from_securities(securities_payload)
+                if depot_accounts:
+                    by_id = {str(a.get("id") or ""): a for a in normalized if str(a.get("id") or "").strip()}
+                    for acc in depot_accounts:
+                        acc_id = str(acc.get("id") or "").strip()
+                        if not acc_id:
+                            continue
+                        if acc_id in by_id:
+                            by_id[acc_id].update({k: v for k, v in acc.items() if v is not None})
+                        else:
+                            normalized.append(acc)
+                            by_id[acc_id] = acc
+
         finally:
             context.close()
 
@@ -2686,6 +2889,215 @@ def fetch_transactions_export(context, access_token: str, account_id: str, date_
         return {"raw": resp.text()}
 
 
+def _date_to_yyyymmdd(s: str) -> str:
+    return datetime.strptime(s, "%Y-%m-%d").strftime("%Y%m%d")
+
+
+def fetch_securities_orders(context, access_token: str, account_id: str, date_from: str, date_to: str) -> list[dict]:
+    """Fetch securities orders (finished) for a depot account."""
+    base_url = "https://api.sparkasse.at/sec-trading/rest/securities/orders"
+    headers = {
+        "Accept": "application/vnd.at.sitsolutions.services.sec.trading.representation.orderbook.page.v2+json",
+        "Accept-Language": "en",
+        "Authorization": f"Bearer {access_token}",
+    }
+    from_s = _date_to_yyyymmdd(date_from)
+    to_s = _date_to_yyyymmdd(date_to)
+
+    page = 0
+    size = 100
+    all_items: list[dict] = []
+
+    while True:
+        url = (
+            f"{base_url}?statusGroup=finished&size={size}&page={page}"
+            f"&securitiesAccountId={account_id}&from={from_s}&to={to_s}"
+        )
+        try:
+            resp = context.request.get(url, headers=headers, timeout=60000)
+        except Exception as e:
+            raise RuntimeError(f"[securities-orders] API request failed: {e}") from e
+
+        if not resp or not resp.ok:
+            status = resp.status if resp else "N/A"
+            raise RuntimeError(f"[securities-orders] API request failed (status={status})")
+
+        payload = resp.json()
+        orders = []
+        if isinstance(payload, dict):
+            for key in ("securityOrders", "orders", "items", "content", "data"):
+                v = payload.get(key)
+                if isinstance(v, list):
+                    orders = [x for x in v if isinstance(x, dict)]
+                    break
+        elif isinstance(payload, list):
+            orders = [x for x in payload if isinstance(x, dict)]
+
+        all_items.extend(orders)
+
+        page_count = payload.get("pageCount") if isinstance(payload, dict) else None
+        if isinstance(page_count, int) and page + 1 >= page_count:
+            break
+        if len(orders) < size:
+            break
+        page += 1
+
+    return all_items
+
+
+def _canonicalize_depot_order(order: dict) -> dict:
+    out: dict = {}
+
+    order_id = order.get("id") or order.get("orderNumber")
+    if order_id is not None:
+        out["id"] = str(order_id)
+
+    submission = order.get("submissionDate")
+    if isinstance(submission, str) and submission.strip():
+        out["timestamp"] = submission
+        if len(submission) >= 10:
+            out["bookingDate"] = submission[:10]
+
+    out["kind"] = "trade"
+
+    action = order.get("type")
+    if isinstance(action, str) and action.strip():
+        action = action.strip().upper()
+        out["action"] = action
+
+    amount_amt, amount_ccy = _extract_money(order.get("amount"))
+    if amount_amt is not None and amount_ccy:
+        signed = amount_amt
+        if action == "BUY":
+            signed = -abs(amount_amt)
+        elif action == "SELL":
+            signed = abs(amount_amt)
+        out["amount"] = {"amount": signed, "currency": amount_ccy}
+
+    sec = order.get("security") if isinstance(order.get("security"), dict) else None
+    isin = None
+    name = None
+    if sec:
+        isin = sec.get("isin")
+        name = sec.get("fullTitle") or sec.get("title")
+    if isinstance(isin, str) and isin.strip():
+        out["isin"] = isin.strip()
+    if isinstance(isin, str) or isinstance(name, str):
+        sec_obj: dict = {}
+        if isinstance(isin, str) and isin.strip():
+            sec_obj["isin"] = isin.strip()
+        if isinstance(name, str) and name.strip():
+            sec_obj["name"] = name.strip()
+        if sec_obj:
+            out["security"] = sec_obj
+
+    qty = order.get("executedQuantity")
+    if qty is None:
+        qty = order.get("quantity")
+    if isinstance(qty, (int, float)):
+        out["quantity"] = qty
+        out["unit"] = "STK"
+
+    if amount_amt is not None and amount_ccy and isinstance(qty, (int, float)) and qty:
+        out["price"] = {"amount": abs(amount_amt) / float(qty), "currency": amount_ccy}
+
+    venue = None
+    stock = order.get("stockExchange") if isinstance(order.get("stockExchange"), dict) else None
+    if stock and isinstance(stock.get("name"), str):
+        venue = stock.get("name").strip()
+    if venue:
+        out["venue"] = venue
+
+    desc_bits = []
+    if action and isinstance(qty, (int, float)) and name:
+        desc_bits.append(f"{action} {qty} {name}")
+    elif name:
+        desc_bits.append(str(name))
+    if isinstance(isin, str) and isin.strip():
+        desc_bits.append(isin.strip())
+    if isinstance(order.get("orderType"), str) and order.get("orderType").strip():
+        desc_bits.append(order.get("orderType").strip())
+    if venue:
+        desc_bits.append(venue)
+    if order.get("orderNumber"):
+        desc_bits.append(f"order {order.get('orderNumber')}")
+    if desc_bits:
+        out["description"] = " · ".join(desc_bits)
+
+    return out
+
+
+def _canonicalize_portfolio(securities_account: dict) -> dict:
+    account_id = str(securities_account.get("id") or "")
+    account_iban = None
+    settlement = securities_account.get("settlementAccount")
+    if isinstance(settlement, dict):
+        iban = settlement.get("iban")
+        if isinstance(iban, str) and iban.strip():
+            account_iban = iban.strip()
+    if not account_iban:
+        accountno = securities_account.get("accountno") or securities_account.get("accountNo") or securities_account.get("accountNumber")
+        if isinstance(accountno, (str, int)):
+            account_iban = str(accountno)
+
+    positions: list[dict] = []
+    titles = _collect_titles_from_securities_account(securities_account)
+    for title in titles:
+        name = title.get("title") or title.get("fullTitle")
+        isin = title.get("isin")
+
+        qty = title.get("numberOfShares")
+        if qty is None:
+            qty = 0.0
+            for pos in title.get("positions") or []:
+                if isinstance(pos, dict) and isinstance(pos.get("numberOfShares"), (int, float)):
+                    qty += float(pos.get("numberOfShares"))
+        if isinstance(qty, (int, float)) and qty == 0:
+            qty = None
+
+        price_obj = None
+        positions_list = title.get("positions") if isinstance(title.get("positions"), list) else []
+        if positions_list:
+            last_price = positions_list[0].get("lastPrice") if isinstance(positions_list[0], dict) else None
+            lp_amt, lp_ccy = _extract_money(last_price)
+            if lp_amt is not None and lp_ccy:
+                price_obj = {"amount": lp_amt, "currency": lp_ccy}
+
+        mv_amt, mv_ccy = _extract_money(title.get("marketValue"))
+        perf_amt, perf_ccy = _extract_money(title.get("performance"))
+        perf_pct = title.get("performancePercent")
+        if perf_pct is None:
+            perf_pct = title.get("performancePercentInclFees") or title.get("performancePercentExclFees")
+
+        pos: dict = {}
+        if isinstance(isin, str) and isin.strip():
+            pos["isin"] = isin.strip()
+        if isinstance(name, str) and name.strip():
+            pos["name"] = name.strip()
+        if isinstance(qty, (int, float)):
+            pos["quantity"] = qty
+        if price_obj:
+            pos["price"] = price_obj
+        if mv_amt is not None and mv_ccy:
+            pos["marketValue"] = {"amount": mv_amt, "currency": mv_ccy}
+        if perf_amt is not None and perf_ccy:
+            perf_obj = {"amount": perf_amt, "currency": perf_ccy}
+            if isinstance(perf_pct, (int, float)):
+                perf_obj["percent"] = float(perf_pct)
+            pos["performance"] = perf_obj
+
+        if pos:
+            positions.append(pos)
+
+    return {
+        "institution": "george",
+        "kind": "portfolio",
+        "account": {"id": account_id, "iban": account_iban},
+        "fetchedAt": _now_iso_local(),
+        "positions": positions,
+    }
+
+
 def _canonicalize_george_transaction(tx: dict) -> dict:
     """Best-effort mapping from George export.json to our canonical schema.
 
@@ -2890,6 +3302,78 @@ def fetch_transactions_paged(context, access_token: str, account_id: str, date_f
     return all_items
 
 
+def cmd_portfolio(args):
+    """Fetch portfolio holdings for a depot account."""
+    account_id = str(args.account or "").strip()
+    if not account_id:
+        print("[portfolio] ERROR: --account is required")
+        return 1
+
+    try:
+        user_id = _resolve_user_id(args)
+    except Exception as e:
+        print(f"[portfolio] ERROR: {e}")
+        return 1
+
+    profile_dir = _get_profile_dir(user_id)
+    global USER_ID_OVERRIDE
+    USER_ID_OVERRIDE = user_id
+
+    raw_payload = None
+    auth_header_value: str | None = None
+
+    with sync_playwright() as p:
+        context = p.chromium.launch_persistent_context(
+            user_data_dir=str(profile_dir),
+            headless=not args.visible,
+            viewport={"width": 1280, "height": 900},
+        )
+        page = context.new_page()
+        try:
+            token_cache = _load_token_cache(user_id) or {}
+            token = token_cache.get("accessToken") if isinstance(token_cache, dict) else None
+            if isinstance(token, str) and token.strip():
+                try:
+                    auth_header_value = f"Bearer {token.strip()}"
+                    raw_payload = fetch_my_securities_account(context, auth_header_value, account_id)
+                except Exception:
+                    raw_payload = None
+                    auth_header_value = None
+
+            if raw_payload is None:
+                if not login(page, timeout_seconds=_login_timeout(args)):
+                    return 1
+                dismiss_modals(page)
+
+                auth_header = capture_bearer_auth_header(context, page, timeout_s=10)
+                if not auth_header:
+                    print("[portfolio] ERROR: Could not capture API Authorization header", flush=True)
+                    return 1
+
+                auth_header_value = auth_header
+                raw_payload = fetch_my_securities_account(context, auth_header_value, account_id)
+                tok = _extract_bearer_token(auth_header_value)
+                if tok:
+                    _save_token_cache(user_id, tok, source="auth_header")
+
+            raw_path = _write_debug_json(f"securities-account-raw-{account_id}", raw_payload)
+
+            wrapper = _canonicalize_portfolio(raw_payload if isinstance(raw_payload, dict) else {})
+            if DEBUG_ENABLED:
+                if raw_path:
+                    wrapper["rawPath"] = str(raw_path)
+                wrapper["raw"] = raw_payload
+
+            if getattr(args, "json", False):
+                print(json.dumps(wrapper, ensure_ascii=False, indent=2))
+            else:
+                print(json.dumps(wrapper, ensure_ascii=False, separators=(",", ":")))
+
+            return 0
+        finally:
+            context.close()
+
+
 def cmd_transactions(args):
     """Download transactions for an account id (API-based).
 
@@ -2966,6 +3450,8 @@ def cmd_transactions(args):
             token_cache = _load_token_cache(user_id) or {}
             token = token_cache.get("accessToken") if isinstance(token_cache, dict) else None
             raw_payload = None
+            depot_account = None
+            is_depot = False
 
             def _do_fetch(t):
                 if method == "paging":
@@ -2986,10 +3472,25 @@ def cmd_transactions(args):
                     )
 
             if isinstance(token, str) and token.strip():
+                token = token.strip()
                 try:
-                    raw_payload = _do_fetch(token.strip())
+                    securities_payload = fetch_my_securities(context, f"Bearer {token}")
+                    depot_account = _find_securities_account(securities_payload, account_id)
                 except Exception:
-                    raw_payload = None
+                    depot_account = None
+
+                if depot_account:
+                    is_depot = True
+                    try:
+                        raw_payload = fetch_securities_orders(context, token, account_id, date_from, date_until)
+                    except Exception:
+                        raw_payload = None
+
+                if raw_payload is None and not is_depot:
+                    try:
+                        raw_payload = _do_fetch(token)
+                    except Exception:
+                        raw_payload = None
 
             if raw_payload is None:
                 if not login(page, timeout_seconds=_login_timeout(args)):
@@ -3007,13 +3508,36 @@ def cmd_transactions(args):
                     return 1
 
                 _save_token_cache(user_id, tok, source="auth_header")
-                raw_payload = _do_fetch(tok)
+                is_depot = False
+                try:
+                    securities_payload = fetch_my_securities(context, f"Bearer {tok}")
+                    depot_account = _find_securities_account(securities_payload, account_id)
+                except Exception:
+                    depot_account = None
+
+                if depot_account:
+                    is_depot = True
+                    raw_payload = fetch_securities_orders(context, tok, account_id, date_from, date_until)
+                else:
+                    raw_payload = _do_fetch(tok)
 
             # Debug raw
             raw_path = _write_debug_json(
                 f"transactions-raw-{(account.get('id') or 'account')}-{date_from}-{date_until}",
                 raw_payload,
             )
+
+            # Update account info for depots
+            if depot_account:
+                account["type"] = "depot"
+                account["name"] = depot_account.get("description") or depot_account.get("productI18N") or account_id
+                settlement = depot_account.get("settlementAccount") if isinstance(depot_account.get("settlementAccount"), dict) else None
+                if settlement and isinstance(settlement.get("iban"), str) and settlement.get("iban").strip():
+                    account["iban"] = settlement.get("iban").strip()
+                else:
+                    accountno = depot_account.get("accountno") or depot_account.get("accountNo") or depot_account.get("accountNumber")
+                    if isinstance(accountno, (str, int)):
+                        account["iban"] = str(accountno)
 
             # Canonical wrapper
             raw_list = raw_payload if isinstance(raw_payload, list) else []
@@ -3023,7 +3547,10 @@ def cmd_transactions(args):
             for tx in raw_list:
                 if not isinstance(tx, dict):
                     continue
-                c = _canonicalize_george_transaction(tx)
+                if is_depot:
+                    c = _canonicalize_depot_order(tx)
+                else:
+                    c = _canonicalize_george_transaction(tx)
 
                 # Credit cards: keep default output lean; only include raw per-item payload when --debug.
                 if DEBUG_ENABLED and is_creditcard:
@@ -3120,6 +3647,11 @@ def main():
     acc_parser = subparsers.add_parser("accounts", help="List available accounts (live)")
     acc_parser.add_argument("--json", action="store_true", help="Output canonical JSON")
     acc_parser.set_defaults(func=cmd_accounts)
+
+    portfolio_parser = subparsers.add_parser("portfolio", help="Fetch depot portfolio holdings")
+    portfolio_parser.add_argument("--account", required=True, help="Depot account id")
+    portfolio_parser.add_argument("--json", action="store_true", help="Pretty JSON output (default: compact)")
+    portfolio_parser.set_defaults(func=cmd_portfolio)
 
     transactions_parser = subparsers.add_parser("transactions", help="Download transactions")
     transactions_parser.add_argument("--account", required=True, help="Account id (use 'accounts' to list)")
