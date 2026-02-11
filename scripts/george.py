@@ -124,12 +124,8 @@ def _default_state_dir() -> Path:
 
 def _default_output_dir() -> Path:
     # Ephemeral outputs (exports, PDFs, canonical JSON) go to /tmp by default.
-    # Override with OPENCLAW_TMP (preferred) or MOLTBOT_TMP (legacy).
-    tmp_root = Path(
-        os.environ.get("OPENCLAW_TMP")
-        or os.environ.get("MOLTBOT_TMP")
-        or "/tmp"
-    ).expanduser().resolve()
+    # Override with OPENCLAW_TMP if you want a different temp root.
+    tmp_root = Path(os.environ.get("OPENCLAW_TMP") or "/tmp").expanduser().resolve()
     return tmp_root / "openclaw" / "george"
 
 

@@ -2,7 +2,7 @@
 name: george
 description: "Automate George online banking (Erste Bank / Sparkasse Austria): login/logout, list accounts, and fetch transactions via Playwright."
 summary: "George banking automation: login, accounts, transactions."
-version: 1.1.2
+version: 1.1.3
 homepage: https://github.com/odrobnik/george-skill
 metadata: {"openclaw": {"emoji": "🏦", "requires": {"bins": ["python3", "playwright"]}}}
 ---
@@ -25,4 +25,4 @@ python3 {baseDir}/scripts/george.py transactions --account <id|iban> --from YYYY
 ## Notes
 - Uses Playwright (phone approval during login).
 - Session state stored in `<workspace>/george/` by default (override with `--dir` / `GEORGE_DIR`). The skill applies a strict umask and uses `chmod` to keep this state directory and the persisted `token.json` private (best-effort: dirs `700`, files `600`).
-- Ephemeral exports default to `/tmp/openclaw/george` (override with `OPENCLAW_TMP`, legacy `MOLTBOT_TMP`).
+- Ephemeral exports default to `/tmp/openclaw/george` (override with `OPENCLAW_TMP`).
