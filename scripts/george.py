@@ -191,6 +191,36 @@ def _extract_token_expires_in_seconds(url: str | None) -> int | None:
         return None
 
 
+def _safe_filename_component(value: str | None, default: str = "value") -> str:
+    """Sanitize a user-controlled string for safe use in filenames.
+
+    Prevents path traversal by stripping path separators and limiting characters.
+    """
+    s = str(value or "").strip()
+    if not s:
+        return default
+
+    # Remove path separators (both POSIX and Windows)
+    s = s.replace("/", "_").replace("\\", "_")
+    try:
+        sep = os.sep
+        if sep:
+            s = s.replace(sep, "_")
+        alt = os.altsep
+        if alt:
+            s = s.replace(alt, "_")
+    except Exception:
+        pass
+
+    # Keep only safe characters
+    s = re.sub(r"[^A-Za-z0-9._-]+", "_", s)
+    s = re.sub(r"_+", "_", s)
+    s = s.strip("._-")
+    if not s:
+        s = default
+    return s[:80]
+
+
 def _safe_url_for_logs(url: str | None) -> str:
     """Redact sensitive info from URLs before logging.
 
@@ -3505,14 +3535,14 @@ def cmd_transactions(args):
         p = Path(output_target)
         if p.is_dir() or str(output_target).endswith(os.sep):
             p.mkdir(parents=True, exist_ok=True)
-            acct = (account.get("iban") or account.get("id") or "account").replace(" ", "")
+            acct = _safe_filename_component(account.get("iban") or account.get("id") or "account", default="account")
             out_base = p / f"transactions_{acct}_{date_from}_{date_until}"
         else:
             p.parent.mkdir(parents=True, exist_ok=True)
             out_base = p
     else:
         DEFAULT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        acct = (account.get("iban") or account.get("id") or "account").replace(" ", "")
+        acct = _safe_filename_component(account.get("iban") or account.get("id") or "account", default="account")
         out_base = DEFAULT_OUTPUT_DIR / f"transactions_{acct}_{date_from}_{date_until}"
 
     print(f"[george] Fetching {fmt.upper()} for {account.get('name')} ({date_from} -> {date_until}) (User: {user_id}, Method: {method})", flush=True)
