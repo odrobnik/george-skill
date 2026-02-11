@@ -12,5 +12,5 @@ python3 scripts/george.py transactions --account <id|iban> --from YYYY-MM-DD --u
 
 ## Notes
 - Playwright is required; login requires phone approval.
-- Session state stored in `~/.moltbot/george/` (override with `--dir`).
+- Session state stored in `<workspace>/george/` by default (override with `--dir` / `GEORGE_DIR`).
 - See `SKILL.md` for agent usage guidance.

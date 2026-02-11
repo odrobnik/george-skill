@@ -2138,7 +2138,7 @@ def cmd_setup(args):
     else:
         print("Your George user ID can be found in the George app.")
         print("It can be an 8–9 digit Verfügernummer or a custom username.")
-        print("Tip: you can also set GEORGE_USER_ID in ~/.moltbot/george/.env")
+        print("Tip: you can also set GEORGE_USER_ID in <stateDir>/.env (stateDir defaults to <workspace>/george)")
         print()
         user_id = input("User ID: ").strip()
     
