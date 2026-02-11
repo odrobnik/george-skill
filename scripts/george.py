@@ -27,6 +27,47 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit, parse_qsl
 
 
+def _set_strict_umask() -> None:
+    """Best-effort hardening: ensure files/dirs are private by default.
+
+    This mainly protects persisted Playwright session state (cookies/storage) and token.json
+    from other local users on the same machine.
+    """
+    try:
+        os.umask(0o077)
+    except Exception:
+        pass
+
+
+def _chmod(path: Path, mode: int) -> None:
+    try:
+        os.chmod(path, mode)
+    except Exception:
+        return
+
+
+def _harden_tree(root: Path) -> None:
+    """Best-effort recursive permission hardening (dirs 700, files 600)."""
+    try:
+        if not root.exists():
+            return
+        for dirpath, dirnames, filenames in os.walk(root):
+            _chmod(Path(dirpath), 0o700)
+            for fn in filenames:
+                p = Path(dirpath) / fn
+                try:
+                    if p.is_symlink():
+                        continue
+                except Exception:
+                    pass
+                _chmod(p, 0o600)
+    except Exception:
+        return
+
+
+_set_strict_umask()
+
+
 def _find_workspace_root() -> Path:
     """Walk up from script location to find workspace root (parent of 'skills/')."""
     env = os.environ.get("GEORGE_WORKSPACE")
@@ -83,9 +124,13 @@ def _default_state_dir() -> Path:
 
 def _default_output_dir() -> Path:
     # Ephemeral outputs (exports, PDFs, canonical JSON) go to /tmp by default.
-    # Override with MOLTBOT_TMP if you want a different temp root.
-    tmp_root = Path(os.environ.get("MOLTBOT_TMP", "/tmp")).expanduser().resolve()
-    return tmp_root / "moltbot" / "george"
+    # Override with OPENCLAW_TMP (preferred) or MOLTBOT_TMP (legacy).
+    tmp_root = Path(
+        os.environ.get("OPENCLAW_TMP")
+        or os.environ.get("MOLTBOT_TMP")
+        or "/tmp"
+    ).expanduser().resolve()
+    return tmp_root / "openclaw" / "george"
 
 
 # Runtime state dir (override via --dir or GEORGE_DIR)
@@ -194,6 +239,9 @@ def _apply_state_dir(dir_value: str | None) -> None:
     global DEBUG_DIR
     DEBUG_DIR = STATE_DIR / "debug"
 
+    # Ensure the state dir exists and is private.
+    _ensure_dir(STATE_DIR)
+
     # Load optional .env from the state dir.
     _load_dotenv(STATE_DIR / ".env")
 
@@ -205,6 +253,7 @@ def _now_iso_local() -> str:
 
 def _ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
+    _chmod(p, 0o700)
 
 
 DEBUG_ENABLED: bool = False
@@ -218,6 +267,7 @@ def _write_debug_json(prefix: str, payload) -> Path | None:
     ts = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
     out = DEBUG_DIR / f"{ts}-{prefix}.json"
     out.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+    _chmod(out, 0o600)
     return out
 
 
@@ -242,6 +292,8 @@ def _save_token_cache(user_id: str, access_token: str, source: str = "auth_heade
             "source": source,
         }
         p.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+        _chmod(p, 0o600)
+        _chmod(p.parent, 0o700)
     except Exception:
         return
 
@@ -2058,6 +2110,7 @@ def cmd_login(args):
         return 1
 
     profile_dir = _get_profile_dir(user_id)
+    _ensure_dir(profile_dir)
     print(f"[login] User: {user_id}", flush=True)
 
     global USER_ID_OVERRIDE
@@ -2072,6 +2125,8 @@ def cmd_login(args):
         page = context.new_page()
         try:
             if login(page, timeout_seconds=_login_timeout(args)):
+                # Best-effort: harden Playwright profile permissions after login.
+                _harden_tree(profile_dir)
                 print(f"[login] Success! Session saved to {profile_dir.name}", flush=True)
                 return 0
             return 1
