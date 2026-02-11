@@ -27,6 +27,19 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit, parse_qsl
 
 
+def _find_workspace_root() -> Path:
+    """Walk up from script location to find workspace root (parent of 'skills/')."""
+    env = os.environ.get("GEORGE_WORKSPACE")
+    if env:
+        return Path(env)
+    d = Path(__file__).resolve().parent
+    for _ in range(6):
+        if (d / "skills").is_dir() and d != d.parent:
+            return d
+        d = d.parent
+    return Path.cwd()
+
+
 def _load_dotenv(path: Path) -> None:
     """Best-effort .env loader (KEY=VALUE lines)."""
     try:
@@ -57,9 +70,9 @@ else:
         sys.exit(1)
 
 def _default_state_dir() -> Path:
-    # Keep George state alongside the OpenClaw workspace.
-    # Default: ~/clawd/george (override via --dir or GEORGE_DIR)
-    return Path.home() / "clawd" / "george"
+    # Keep George state in the workspace.
+    # Default: workspace/george (override via --dir or GEORGE_DIR)
+    return _find_workspace_root() / "george"
 
 
 def _default_output_dir() -> Path:
@@ -3636,7 +3649,7 @@ def main():
     
     # Global options
     parser.add_argument("--visible", action="store_true", help="Show browser window")
-    parser.add_argument("--dir", default=None, help="State directory (default: ~/clawd/george; override via GEORGE_DIR)")
+    parser.add_argument("--dir", default=None, help="State directory (default: workspace/george; override via GEORGE_DIR)")
     parser.add_argument("--login-timeout", type=int, default=DEFAULT_LOGIN_TIMEOUT, help="Seconds to wait for phone approval")
     parser.add_argument("--user-id", default=None, help="Override George user number/username (or set GEORGE_USER_ID)")
     parser.add_argument("--debug", action="store_true", help="Save bank-native payloads to <stateDir>/debug (default: off)")

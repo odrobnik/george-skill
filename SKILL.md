@@ -4,7 +4,7 @@ description: "Automate George online banking (Erste Bank / Sparkasse Austria): l
 summary: "George banking automation: login, accounts, transactions."
 version: 1.1.0
 homepage: https://github.com/odrobnik/george-skill
-metadata: {"moltbot": {"emoji": "🏦", "requires": {"bins": ["python3", "playwright"]}}}
+metadata: {"openclaw": {"emoji": "🏦", "requires": {"bins": ["python3", "playwright"]}}}
 ---
 
 # George Banking Automation
