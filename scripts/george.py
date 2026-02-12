@@ -114,7 +114,7 @@ else:
 
 def _default_state_dir() -> Path:
     # Keep George state in the workspace.
-    # Default: workspace/george (override via --dir or GEORGE_DIR)
+    # Always: workspace/george
     return _find_workspace_root() / "george"
 
 
@@ -125,7 +125,7 @@ def _default_output_dir() -> Path:
     return tmp_root / "openclaw" / "george"
 
 
-# Runtime state dir (override via --dir or GEORGE_DIR)
+# Runtime state dir (always workspace/george)
 STATE_DIR: Path = _default_state_dir()
 DEFAULT_OUTPUT_DIR: Path = _default_output_dir()
 
@@ -246,16 +246,11 @@ def _safe_url_for_logs(url: str | None) -> str:
         return "<redacted-url>"
 
 
-def _apply_state_dir(dir_value: str | None) -> None:
-    """Apply state dir override and recompute derived paths."""
+def _apply_state_dir() -> None:
+    """Recompute derived paths from the fixed workspace state dir."""
     global STATE_DIR, DEFAULT_OUTPUT_DIR
 
-    if dir_value:
-        STATE_DIR = Path(dir_value).expanduser().resolve()
-    else:
-        env_dir = os.environ.get("GEORGE_DIR")
-        STATE_DIR = Path(env_dir).expanduser().resolve() if env_dir else _default_state_dir()
-
+    STATE_DIR = _default_state_dir()
     DEFAULT_OUTPUT_DIR = _default_output_dir()
 
     global DEBUG_DIR
@@ -3731,7 +3726,7 @@ def main():
     
     # Global options
     parser.add_argument("--visible", action="store_true", help="Show browser window")
-    parser.add_argument("--dir", default=None, help="State directory (default: workspace/george; override via GEORGE_DIR)")
+    # State dir is always workspace/george (no override).
     parser.add_argument("--login-timeout", type=int, default=DEFAULT_LOGIN_TIMEOUT, help="Seconds to wait for phone approval")
     parser.add_argument("--user-id", default=None, help="Override George user number/username (or set GEORGE_USER_ID)")
     parser.add_argument("--debug", action="store_true", help="Save bank-native payloads to <stateDir>/debug (default: off)")
@@ -3763,7 +3758,7 @@ def main():
     transactions_parser.set_defaults(func=cmd_transactions)
     
     args = parser.parse_args()
-    _apply_state_dir(getattr(args, "dir", None))
+    _apply_state_dir()
 
     global DEBUG_ENABLED
     DEBUG_ENABLED = bool(getattr(args, "debug", False))

@@ -2,7 +2,7 @@
 name: george
 description: "Automate George online banking (Erste Bank / Sparkasse Austria): login/logout, list accounts, and fetch transactions via Playwright."
 summary: "George banking automation: login, accounts, transactions."
-version: 1.2.1
+version: 1.3.0
 homepage: https://github.com/odrobnik/george-skill
 metadata: {"openclaw": {"emoji": "🏦", "requires": {"bins": ["python3", "playwright"]}}}
 ---
@@ -26,6 +26,15 @@ python3 {baseDir}/scripts/george.py accounts
 python3 {baseDir}/scripts/george.py transactions --account <id|iban> --from YYYY-MM-DD --until YYYY-MM-DD
 ```
 
+## Recommended Flow
+
+```
+login → accounts → transactions → portfolio → logout
+```
+
+Always call `logout` after completing all operations to clear the stored browser session (cookies, local storage, Playwright profile). This minimizes persistent auth state on disk.
+
 ## Notes
-- Session state stored in `{workspace}/george/` by default (override with `--dir` / `GEORGE_DIR`). The skill applies a strict umask and uses `chmod` to keep this state directory and the persisted `token.json` private (best-effort: dirs `700`, files `600`).
+- Session state stored in `{workspace}/george/`. The skill applies a strict umask and uses `chmod` to keep this state directory and the persisted `token.json` private (best-effort: dirs `700`, files `600`).
 - Ephemeral exports default to `/tmp/openclaw/george` (override with `OPENCLAW_TMP`).
+- No `.env` file loading — credentials via `GEORGE_USER_ID` env var or `--user-id` flag.
