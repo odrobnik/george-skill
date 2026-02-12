@@ -87,22 +87,18 @@ def _find_workspace_root() -> Path:
     return Path.cwd()
 
 
-def _load_dotenv(path: Path) -> None:
-    """Best-effort .env loader (KEY=VALUE lines)."""
-    try:
-        if not path.exists():
-            return
-        for line in path.read_text().splitlines():
-            s = line.strip()
-            if not s or s.startswith("#") or "=" not in s:
-                continue
-            k, v = s.split("=", 1)
-            k = k.strip()
-            v = v.strip().strip('"').strip("'")
-            if k and k not in os.environ:
-                os.environ[k] = v
-    except Exception:
-        return
+def _safe_download_filename(suggested: str) -> str:
+    """Sanitise a Playwright suggested_filename to prevent path traversal.
+
+    Strips directory components (including '..') and falls back to a
+    safe default if the result is empty or suspicious.
+    """
+    # Take only the final component (basename) — removes any directory part.
+    name = Path(suggested).name if suggested else ""
+    # Extra guard: reject hidden files and empty names.
+    if not name or name.startswith("."):
+        name = "download.bin"
+    return name
 
 
 # Fast path: allow `--help` without requiring Playwright.
@@ -268,8 +264,7 @@ def _apply_state_dir(dir_value: str | None) -> None:
     # Ensure the state dir exists and is private.
     _ensure_dir(STATE_DIR)
 
-    # Load optional .env from the state dir.
-    _load_dotenv(STATE_DIR / ".env")
+    # No .env loading — use GEORGE_USER_ID env var or --user-id flag
 
 
 
@@ -1735,10 +1730,11 @@ def download_statements_pdf(page, account: dict, statement_ids: list[int],
                 page.get_by_role("button", name="Download").last.click(force=True)
         
         download = download_info.value
-        print(f"[statements] Downloaded: {download.suggested_filename}", flush=True)
+        safe_name = _safe_download_filename(download.suggested_filename)
+        print(f"[statements] Downloaded: {safe_name}", flush=True)
         
         if download_dir:
-            dest = download_dir / download.suggested_filename
+            dest = download_dir / safe_name
             download.save_as(dest)
             print(f"[statements] Saved: {dest}", flush=True)
             return [dest]
@@ -1790,9 +1786,10 @@ def download_data_exports(page, export_type: str, download_dir: Path = None) -> 
                 download_btn.click()
             dl = download_info.value
             if download_dir:
-                dest = download_dir / dl.suggested_filename
+                safe_name = _safe_download_filename(dl.suggested_filename)
+                dest = download_dir / safe_name
                 dl.save_as(dest)
-                print(f"[export] Saved: {dest.name}", flush=True)
+                print(f"[export] Saved: {safe_name}", flush=True)
                 downloaded.append(dest)
             time.sleep(1)
         except Exception as e:
@@ -2190,8 +2187,6 @@ def _resolve_user_id(args) -> str:
     1) --user-id (explicit)
     2) GEORGE_USER_ID from environment
 
-    Note: the state dir may provide a .env file (loaded by _apply_state_dir) that sets
-    GEORGE_USER_ID, but it never overrides an already-set environment variable.
     """
     if getattr(args, "user_id", None):
         return str(args.user_id).strip()
@@ -2203,7 +2198,7 @@ def _resolve_user_id(args) -> str:
     raise ValueError(
         "No user id configured. Provide one of:\n"
         "- --user-id <your-user-number-or-username>\n"
-        "- set GEORGE_USER_ID (or put it in <stateDir>/.env)"
+        "- set GEORGE_USER_ID env var"
     )
 
 
@@ -2219,7 +2214,7 @@ def cmd_setup(args):
     else:
         print("Your George user ID can be found in the George app.")
         print("It can be an 8–9 digit Verfügernummer or a custom username.")
-        print("Tip: you can also set GEORGE_USER_ID in <stateDir>/.env (stateDir defaults to <workspace>/george)")
+        print("Tip: you can also set GEORGE_USER_ID as an environment variable.")
         print()
         user_id = input("User ID: ").strip()
     
@@ -3491,7 +3486,7 @@ def cmd_transactions(args):
 
     # User selection:
     # - --user-id overrides everything
-    # - otherwise GEORGE_USER_ID (from env or <stateDir>/.env)
+    # - otherwise GEORGE_USER_ID from env
     try:
         user_id = _resolve_user_id(args)
     except Exception as e:
