@@ -70,9 +70,9 @@ _set_strict_umask()
 
 def _find_workspace_root() -> Path:
     """Walk up from script location to find workspace root (parent of 'skills/')."""
-    env = os.environ.get("GEORGE_WORKSPACE")
+    env = os.environ.get("OPENCLAW_WORKSPACE")
     if env:
-        return Path(env)
+        return Path(env).resolve()
     
     # Prefer CWD if it looks like a workspace (handles symlinks correctly)
     cwd = Path.cwd()
@@ -85,6 +85,20 @@ def _find_workspace_root() -> Path:
             return d
         d = d.parent
     return Path.cwd()
+
+
+# Data-carrier uploads are XML-based financial formats only.
+_ALLOWED_UPLOAD_EXTENSIONS = {".xml", ".camt", ".camt053", ".pain", ".pain001", ".mt940"}
+
+def _validate_upload_file(file_path: Path) -> None:
+    """Reject non-XML data-carrier files before upload."""
+    suffix = file_path.suffix.lower()
+    if suffix not in _ALLOWED_UPLOAD_EXTENSIONS:
+        raise ValueError(
+            f"Unsupported file type '{suffix}'. "
+            f"Data-carrier uploads accept only XML-based formats: "
+            f"{', '.join(sorted(_ALLOWED_UPLOAD_EXTENSIONS))}"
+        )
 
 
 def _safe_download_filename(suggested: str) -> str:
@@ -2604,9 +2618,15 @@ def cmd_datacarrier_upload(args):
     global USER_ID_OVERRIDE
     USER_ID_OVERRIDE = user_id
 
-    file_path = Path(args.file).expanduser()
+    file_path = Path(args.file).expanduser().resolve()
     if not file_path.exists() or not file_path.is_file():
         print(f"[datacarrier-upload] ERROR: File not found: {file_path}", flush=True)
+        return 1
+
+    try:
+        _validate_upload_file(file_path)
+    except ValueError as e:
+        print(f"[datacarrier-upload] ERROR: {e}", flush=True)
         return 1
 
     output_dir = Path(args.output) if args.output else None

@@ -2,7 +2,7 @@
 name: george
 description: "Automate George online banking (Erste Bank / Sparkasse Austria): login/logout, list accounts, and fetch transactions via Playwright."
 summary: "George banking automation: login, accounts, transactions."
-version: 1.3.0
+version: 1.3.1
 homepage: https://github.com/odrobnik/george-skill
 metadata: {"openclaw": {"emoji": "🏦", "requires": {"bins": ["python3", "playwright"]}}}
 ---
