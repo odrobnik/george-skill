@@ -19,7 +19,6 @@ import argparse
 import json
 import os
 import re
-import subprocess
 import time
 import uuid
 from datetime import datetime, date, timedelta, timezone
@@ -2217,18 +2216,12 @@ def cmd_setup(args):
     print("[setup] George Banking Setup")
     print()
     
-    # Get user ID
-    if args.user_id:
-        user_id = args.user_id
-    else:
-        print("Your George user ID can be found in the George app.")
-        print("It can be an 8–9 digit Verfügernummer or a custom username.")
-        print("Tip: you can also set GEORGE_USER_ID as an environment variable.")
-        print()
-        user_id = input("User ID: ").strip()
+    # Get user ID from args or env
+    user_id = args.user_id or os.environ.get("GEORGE_USER_ID", "")
     
     if not user_id:
         print("[setup] ERROR: User ID required")
+        print("[setup] Provide via --user-id flag or GEORGE_USER_ID env var")
         return 1
     
     # Create config directory
@@ -2252,25 +2245,11 @@ def cmd_setup(args):
     print("[setup] Checking playwright...")
     try:
         from playwright.sync_api import sync_playwright
-        print("[setup] ✓ Playwright already installed")
+        print("[setup] ✓ Playwright available")
     except ImportError:
-        print("[setup] Installing playwright...")
-        try:
-            subprocess.run([sys.executable, "-m", "pip", "install", "playwright"], check=True)
-            print("[setup] ✓ Playwright installed")
-        except subprocess.CalledProcessError:
-            print("[setup] ERROR: Failed to install playwright")
-            print("[setup] Run manually: pip install playwright")
-            return 1
-    
-    # Install chromium browser
-    print("[setup] Installing chromium browser...")
-    try:
-        subprocess.run(["playwright", "install", "chromium"], check=True)
-        print("[setup] ✓ Chromium installed")
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        print("[setup] WARNING: Could not install chromium")
-        print("[setup] Run manually: playwright install chromium")
+        print("[setup] ERROR: Playwright not installed")
+        print("[setup] Run: pip install playwright && playwright install chromium")
+        return 1
     
     print()
     print("[setup] ✓ Setup complete!")
