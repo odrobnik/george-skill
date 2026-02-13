@@ -14,3 +14,9 @@ python3 scripts/george.py transactions --account <id|iban> --from YYYY-MM-DD --u
 - Playwright is required; login requires phone approval.
 - Session state stored in `<workspace>/george/` by default (override with `--dir` / `GEORGE_DIR`).
 - See `SKILL.md` for agent usage guidance.
+
+## Documentation
+
+- [SKILL.md](SKILL.md) — agent-facing reference (commands, behavior, limitations)
+- [SETUP.md](SETUP.md) — prerequisites, configuration, and setup instructions
+- [ClawHub](https://www.clawhub.com/skills/george) — install via ClawHub registry
