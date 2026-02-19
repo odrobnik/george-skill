@@ -90,7 +90,28 @@ def _find_workspace_root() -> Path:
 _ALLOWED_UPLOAD_EXTENSIONS = {".xml", ".camt", ".camt053", ".pain", ".pain001", ".mt940"}
 
 def _validate_upload_file(file_path: Path) -> None:
-    """Reject non-XML data-carrier files before upload."""
+    """Validate a data-carrier file before upload.
+
+    Checks:
+    1. Path traversal protection (resolve to real path, reject symlinks outside cwd)
+    2. File extension allowlist
+    3. Content sniff (must look like XML, not arbitrary binary)
+    """
+    # Path traversal protection: resolve to absolute, reject if it escapes
+    # the current working directory or home directory.
+    resolved = file_path.resolve()
+    home = Path.home().resolve()
+    cwd = Path.cwd().resolve()
+    if not (str(resolved).startswith(str(cwd)) or str(resolved).startswith(str(home))):
+        raise ValueError(
+            f"Path traversal blocked: '{file_path}' resolves to '{resolved}' "
+            f"which is outside the home directory."
+        )
+
+    if not resolved.is_file():
+        raise ValueError(f"File not found: '{file_path}'")
+
+    # Extension check
     suffix = file_path.suffix.lower()
     if suffix not in _ALLOWED_UPLOAD_EXTENSIONS:
         raise ValueError(
@@ -98,6 +119,21 @@ def _validate_upload_file(file_path: Path) -> None:
             f"Data-carrier uploads accept only XML-based formats: "
             f"{', '.join(sorted(_ALLOWED_UPLOAD_EXTENSIONS))}"
         )
+
+    # Content sniff: first non-whitespace bytes must look like XML (<?xml or <Document etc.)
+    try:
+        with open(resolved, "rb") as f:
+            head = f.read(1024)
+        stripped = head.lstrip()
+        if not (stripped.startswith(b"<?xml") or stripped.startswith(b"<") and b">" in stripped[:200]):
+            raise ValueError(
+                f"File '{file_path.name}' does not appear to be XML. "
+                f"First bytes: {stripped[:40]!r}"
+            )
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(f"Cannot read file '{file_path}': {e}") from e
 
 
 def _safe_download_filename(suggested: str) -> str:
@@ -599,6 +635,22 @@ def merge_accounts_into_config(config: dict, fetched_accounts: list[dict]) -> tu
 CONFIG = None
 
 
+def _sanitize_id(value: str, label: str = "id") -> str:
+    """Sanitize an ID parameter to prevent injection via URL or API paths.
+
+    Allows alphanumeric, hyphens, underscores, dots, and spaces (for IBANs).
+    Rejects anything that could be used for path traversal or injection.
+    """
+    cleaned = (value or "").strip()
+    if not cleaned:
+        raise ValueError(f"Empty {label}")
+    if not re.match(r"^[a-zA-Z0-9\s\-_.]+$", cleaned):
+        raise ValueError(f"Invalid characters in {label}: {cleaned!r}")
+    if ".." in cleaned or "/" in cleaned or "\\" in cleaned:
+        raise ValueError(f"Suspicious {label}: {cleaned!r}")
+    return cleaned
+
+
 def get_account(account_key: str) -> dict:
     """Resolve an account by flexible query.
 
@@ -611,7 +663,7 @@ def get_account(account_key: str) -> dict:
 
     If ambiguous, raises with candidates.
     """
-    q = (account_key or "").strip()
+    q = _sanitize_id(account_key, "account key")
     # Config-less mode: caller must provide the internal account id.
     return {"id": q, "name": q, "iban": None, "type": "unknown"}
 
@@ -2818,7 +2870,7 @@ def cmd_datacarrier_sign(args):
     global USER_ID_OVERRIDE
     USER_ID_OVERRIDE = user_id
 
-    datacarrier_id = args.datacarrier_id
+    datacarrier_id = _sanitize_id(args.datacarrier_id, "datacarrier_id")
     output_dir = Path(args.output) if args.output else None
     if output_dir:
         output_dir.mkdir(parents=True, exist_ok=True)
