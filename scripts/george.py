@@ -23,7 +23,7 @@ import time
 import uuid
 from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit, parse_qsl
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, quote
 
 
 def _set_strict_umask() -> None:
@@ -1089,8 +1089,14 @@ def fetch_my_securities(context, auth_header: str) -> dict:
 
 
 def fetch_my_securities_account(context, auth_header: str, account_id: str) -> dict:
-    """Fetch securities (depot) account details, including holdings."""
-    url = f"https://api.sparkasse.at/rest/netbanking/my/securities/{account_id}"
+    """Fetch securities (depot) account details, including holdings.
+
+    Security: account_id is user-provided via CLI flags. Treat it as untrusted and
+    ensure it cannot influence the request path (e.g. via "/" or ".." segments).
+    """
+    safe_id = _sanitize_id(account_id, "securities account id")
+    safe_id_enc = quote(safe_id, safe="")
+    url = f"https://api.sparkasse.at/rest/netbanking/my/securities/{safe_id_enc}"
     headers = {
         "Authorization": auth_header,
         "Accept": "application/vnd.at.sitsolutions.services.sec.account.representation.securities.account.v3+json",
@@ -3535,9 +3541,10 @@ def fetch_transactions_paged(context, access_token: str, account_id: str, date_f
 
 def cmd_portfolio(args):
     """Fetch portfolio holdings for a depot account."""
-    account_id = str(args.account or "").strip()
-    if not account_id:
-        print("[portfolio] ERROR: --account is required")
+    try:
+        account_id = _sanitize_id(str(args.account or ""), "account id")
+    except Exception as e:
+        print(f"[portfolio] ERROR: Invalid --account: {e}")
         return 1
 
     try:
@@ -3610,9 +3617,10 @@ def cmd_transactions(args):
 
     No local account config/cache is used. Pass the George internal account id via --account.
     """
-    account_id = str(args.account or "").strip()
-    if not account_id:
-        print("[transactions] ERROR: --account is required")
+    try:
+        account_id = _sanitize_id(str(args.account or ""), "account id")
+    except Exception as e:
+        print(f"[transactions] ERROR: Invalid --account: {e}")
         return 1
 
     # User selection:
