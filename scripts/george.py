@@ -1760,7 +1760,6 @@ EXPORT_TYPE_LABELS = {
 }
 
 DATACARRIER_UPLOAD_URL = "https://george.sparkasse.at/index.html#/datacarrier/upload"
-DATACARRIER_SIGN_URL_TEMPLATE = "https://george.sparkasse.at/index.html#/datacarrier/upload/sign/{datacarrier_id}?returnUrl=%2Fdatacarrier%2Fupload"
 DATACARRIER_SIGN_API_TEMPLATE = "https://api.sparkasse.at/rest/netbanking/my/orders/datacarriers/{datacarrier_id}/sign/"
 DATACARRIER_FILES_API_URL = "https://api.sparkasse.at/rest/netbanking/my/orders/datacarrier-files"
 
@@ -2585,6 +2584,120 @@ def cmd_export(args):
     return 0
 
 
+def cmd_datacarrier_list(args):
+    """List data-carrier files and orders (uploaded SEPA/CAMT/MT940)."""
+    try:
+        user_id = _resolve_user_id(args)
+    except Exception as e:
+        print(f"[datacarrier-list] ERROR: {e}")
+        return 1
+
+    profile_dir = _get_profile_dir(user_id)
+    global USER_ID_OVERRIDE
+    USER_ID_OVERRIDE = user_id
+
+    state_filter = getattr(args, "state", None)
+    if state_filter:
+        state_filter = state_filter.upper()
+
+    with sync_playwright() as p:
+        context = p.chromium.launch_persistent_context(
+            user_data_dir=str(profile_dir),
+            headless=not args.visible,
+            viewport={"width": 1280, "height": 900},
+        )
+        context.on("dialog", lambda d: d.accept())
+        page = context.new_page()
+
+        try:
+            if not login(page, timeout_seconds=_login_timeout(args)):
+                return 1
+
+            dismiss_modals(page)
+
+            # Intercept API responses from the datacarrier page
+            captured_files = []  # datacarrier-files (uploaded XMLs)
+            captured_orders = []  # datacarriers (imported orders with sign info)
+
+            def _capture_dc_response(response):
+                url = response.url or ""
+                if response.status != 200:
+                    return
+                try:
+                    if "/datacarrier-files" in url:
+                        body = response.json()
+                        items = body.get("datacarrierFiles", []) if isinstance(body, dict) else body
+                        if isinstance(items, list):
+                            captured_files.extend(items)
+                    elif "/datacarriers" in url and "/sign/" not in url and "/settings" not in url:
+                        body = response.json()
+                        items = body.get("dataCarriers", []) if isinstance(body, dict) else body
+                        if isinstance(items, list):
+                            captured_orders.extend(items)
+                except Exception:
+                    pass
+
+            page.on("response", _capture_dc_response)
+
+            # Navigate to the datacarrier upload page (triggers API calls)
+            page.goto(DATACARRIER_UPLOAD_URL, wait_until="domcontentloaded")
+            page.wait_for_load_state("networkidle")
+            time.sleep(2)  # Allow XHR to complete
+
+            # Apply state filter to orders
+            if state_filter:
+                captured_orders = [o for o in captured_orders
+                                   if isinstance(o, dict) and (o.get("state") or "").upper() == state_filter]
+
+            if args.json:
+                output = {
+                    "files": captured_files,
+                    "orders": captured_orders,
+                }
+                print(json.dumps(output, indent=2, sort_keys=True, default=str), flush=True)
+            else:
+                # --- Uploaded files ---
+                if captured_files:
+                    print(f"\n  {len(captured_files)} uploaded file(s):", flush=True)
+                    for f in captured_files:
+                        if not isinstance(f, dict):
+                            continue
+                        name = f.get("name") or f.get("fileName") or "?"
+                        state = f.get("state") or "?"
+                        fid = f.get("id") or "?"
+                        print(f"    {state:<8s}  {name}  ({fid})", flush=True)
+
+                # --- Imported orders ---
+                if captured_orders:
+                    print(f"\n  {len(captured_orders)} order(s):", flush=True)
+                    for o in captured_orders:
+                        if not isinstance(o, dict):
+                            continue
+                        oid = o.get("id") or "?"
+                        ident = o.get("identification") or o.get("name") or "?"
+                        state = o.get("state") or "?"
+                        amt = o.get("sumAmount", {})
+                        amount_val = amt.get("value", 0)
+                        precision = amt.get("precision", 2)
+                        currency = amt.get("currency", "EUR")
+                        amount_str = f"{amount_val / (10 ** precision):,.2f} {currency}"
+                        date = (o.get("uploadedDate") or o.get("creationDate") or "")[:10]
+                        orders_n = o.get("orderCount", "?")
+                        flags = o.get("flags", [])
+                        signable = "signable" in flags
+                        sign_marker = " [SIGNABLE]" if signable else ""
+                        print(f"    {state:<8s}  {date}  {ident}  {amount_str}  ({orders_n} order(s)){sign_marker}", flush=True)
+                        if signable:
+                            print(f"             → datacarrier-sign {oid}", flush=True)
+                else:
+                    if not captured_files:
+                        print("[datacarrier-list] No data-carrier files or orders found.", flush=True)
+        finally:
+            context.close()
+
+    return 0
+
+
 def cmd_datacarrier_upload(args):
     """Upload a data-carrier file."""
     try:
@@ -2687,13 +2800,20 @@ def cmd_datacarrier_upload(args):
 
 
 def cmd_datacarrier_sign(args):
-    """Sign a data-carrier upload."""
+    """Sign a data-carrier upload via George API.
+
+    Flow:
+    1. Login and navigate to upload page (establishes session + captures Bearer token)
+    2. Look up order details and signId from the datacarriers API response
+    3. POST to sign API with Bearer token → triggers phone approval
+    4. Poll until signing completes or times out
+    """
     try:
         user_id = _resolve_user_id(args)
     except Exception as e:
         print(f"[datacarrier-sign] ERROR: {e}")
         return 1
-        
+
     profile_dir = _get_profile_dir(user_id)
     global USER_ID_OVERRIDE
     USER_ID_OVERRIDE = user_id
@@ -2717,207 +2837,172 @@ def cmd_datacarrier_sign(args):
                 return 1
 
             dismiss_modals(page)
-            sign_page_url = DATACARRIER_SIGN_URL_TEMPLATE.format(datacarrier_id=datacarrier_id)
-            sign_api_path = f"/rest/netbanking/my/orders/datacarriers/{datacarrier_id}/sign/"
-            sign_api_base = DATACARRIER_SIGN_API_TEMPLATE.format(datacarrier_id=datacarrier_id)
 
-            # Fast-path: if caller already knows the signId (from DevTools), we can skip UI network discovery.
-            if getattr(args, "sign_id", None):
-                sign_id = str(getattr(args, "sign_id")).strip()
-                sign_api_url = f"{sign_api_base}{sign_id}"
+            # Capture Bearer token from API request headers
+            bearer_token = [None]
+            order_details = {}
+            sign_id_from_api = [None]
 
-                try:
-                    post_response = context.request.post(
-                        sign_api_url,
-                        data=json.dumps({"authorizationType": "GEORGE_TOKEN"}),
-                        headers={"Content-Type": "application/json"},
-                        timeout=30000,
-                    )
-                except Exception as e:
-                    print(f"[datacarrier-sign] ERROR: Signing request failed: {e}", flush=True)
-                    return 1
+            def _capture_request(request):
+                url = request.url or ""
+                if "api.sparkasse" in url and not bearer_token[0]:
+                    auth = request.headers.get("authorization", "")
+                    if auth.startswith("Bearer "):
+                        bearer_token[0] = auth
 
-                try:
-                    post_payload = post_response.json() if post_response else None
-                except Exception:
+            def _capture_dc_response(response):
+                url = response.url or ""
+                if response.status != 200:
+                    return
+                if "/datacarriers" in url and "/sign/" not in url and "/settings" not in url:
                     try:
-                        post_payload = {"raw": post_response.text()} if post_response else None
+                        body = response.json()
+                        items = body.get("dataCarriers", []) if isinstance(body, dict) else body
+                        if isinstance(items, list):
+                            for item in items:
+                                if isinstance(item, dict) and item.get("id") == datacarrier_id:
+                                    order_details.update(item)
+                                    si = item.get("signInfo")
+                                    if isinstance(si, dict):
+                                        sign_id_from_api[0] = si.get("signId")
                     except Exception:
-                        post_payload = {"raw": "<unparseable response>"} if post_response else None
+                        pass
 
-                auth_req_id = None
-                poll_url = None
-                poll_interval_ms = None
-                if isinstance(post_payload, dict):
-                    auth_req_id = post_payload.get("authorizationRequestId")
-                    poll = post_payload.get("poll")
-                    if isinstance(poll, dict):
-                        poll_url = poll.get("url")
-                        poll_interval_ms = poll.get("interval")
+            page.on("request", _capture_request)
+            page.on("response", _capture_dc_response)
 
-                _sid, state = _extract_sign_state(post_payload if isinstance(post_payload, dict) else None)
-                state = state or (post_payload.get("state") if isinstance(post_payload, dict) else None)
+            # Navigate to upload page to trigger API calls and capture auth
+            page.goto(DATACARRIER_UPLOAD_URL, wait_until="domcontentloaded")
+            page.wait_for_load_state("networkidle")
+            time.sleep(2)
 
-                auth_part = f" authReqId={auth_req_id}" if auth_req_id else ""
-                state_part = f" state={state}" if state else ""
-                print(f"[datacarrier-sign] id={datacarrier_id} signId={sign_id}{state_part}{auth_part}", flush=True)
-
-                if output_dir:
-                    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-                    out_path = output_dir / f"datacarrier-sign.{datacarrier_id}.{ts}.json"
-                    with open(out_path, "w") as f:
-                        json.dump(post_payload, f, indent=2, sort_keys=True)
-                    print(f"[datacarrier-sign] Saved response: {out_path}", flush=True)
-
-                # Optional: poll until the signing flow finishes (best-effort; shape may vary).
-                if args.timeout and args.timeout > 0 and poll_url:
-                    start = time.time()
-                    last_state = state
-                    interval_s = (poll_interval_ms / 1000.0) if isinstance(poll_interval_ms, (int, float)) and poll_interval_ms > 0 else float(max(args.poll, 1))
-                    while time.time() - start < args.timeout:
-                        try:
-                            resp = context.request.get(poll_url, timeout=30000)
-                            pj = resp.json()
-                        except Exception:
-                            time.sleep(interval_s)
-                            continue
-
-                        new_state = None
-                        if isinstance(pj, dict):
-                            new_state = (pj.get("state") or (pj.get("signInfo") or {}).get("state") or (pj.get("authorization") or {}).get("state"))
-                        if new_state and new_state != last_state:
-                            print(f"[datacarrier-sign] state={new_state}", flush=True)
-                            last_state = new_state
-                        if new_state and new_state not in ("OPEN", "PENDING", "PROCESSING"):
-                            break
-                        time.sleep(interval_s)
-
-                return 0
-
-            def _is_sign_any(resp) -> bool:
-                try:
-                    return sign_api_path in (resp.url or "") and resp.request.method in ("GET", "POST")
-                except Exception:
-                    return False
-
-            def _is_sign_post(resp) -> bool:
-                try:
-                    return resp.request.method == "POST" and sign_api_path in (resp.url or "")
-                except Exception:
-                    return False
-
-            initial_wait = args.timeout if args.timeout and args.timeout > 0 else 120
-            response = None
-            try:
-                # Some George flows only load sign-info after interacting with the page.
-                with page.expect_response(_is_sign_any, timeout=initial_wait * 1000) as resp_info:
-                    page.goto(sign_page_url, wait_until="domcontentloaded")
-                    time.sleep(2)
-                    dismiss_modals(page)
-                    # Best-effort: trigger any lazy-loaded sign-info.
-                    _click_confirmation_button(page)
-                response = resp_info.value
-            except PlaywrightTimeout:
-                print(
-                    "[datacarrier-sign] ERROR: Timed out waiting for sign info (GET/POST). "
-                    "Is the datacarrier id valid and in the right state?",
-                    flush=True,
-                )
+            token = bearer_token[0]
+            if not token:
+                print("[datacarrier-sign] ERROR: Could not capture Bearer token from API requests.", flush=True)
                 return 1
 
-            try:
-                payload = response.json() if response else None
-            except Exception:
-                try:
-                    payload = {"raw": response.text()} if response else None
-                except Exception:
-                    payload = {"raw": "<unparseable response>"} if response else None
+            # Determine signId: from --sign-id flag, from API response, or from order details
+            sign_id = getattr(args, "sign_id", None)
+            if not sign_id:
+                sign_id = sign_id_from_api[0]
+            if not sign_id:
+                si = order_details.get("signInfo", {})
+                sign_id = si.get("signId") if isinstance(si, dict) else None
 
-            sign_id, state = _extract_sign_state(payload if isinstance(payload, dict) else None)
-            sign_id = sign_id or _extract_sign_id_from_url(response.url if response else None)
-            sign_api_url = response.url if response and sign_id else f"{sign_api_base}{sign_id}" if sign_id else sign_api_base
+            if not sign_id:
+                print(f"[datacarrier-sign] ERROR: Could not determine signId for order {datacarrier_id}.", flush=True)
+                if order_details:
+                    state = order_details.get("state", "?")
+                    print(f"[datacarrier-sign] Order state={state}. May already be signed or not in signable state.", flush=True)
+                else:
+                    print(f"[datacarrier-sign] Order not found in API response.", flush=True)
+                return 1
+
+            # Show order info
+            ident = order_details.get("identification") or datacarrier_id
+            amt = order_details.get("sumAmount", {})
+            amount_val = amt.get("value", 0) / (10 ** amt.get("precision", 2))
+            currency = amt.get("currency", "EUR")
+            print(f"[datacarrier-sign] Order {ident}: {amount_val:.2f} {currency}, signId={sign_id[:16]}...", flush=True)
+
+            # POST to sign API with Bearer token via page.evaluate(fetch)
+            sign_url = DATACARRIER_SIGN_API_TEMPLATE.format(datacarrier_id=datacarrier_id) + sign_id
+            result = page.evaluate("""async ([url, token]) => {
+                try {
+                    const resp = await fetch(url, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Authorization': token
+                        },
+                        body: JSON.stringify({authorizationType: 'GEORGE_TOKEN'})
+                    });
+                    const text = await resp.text();
+                    let body = null;
+                    try { body = JSON.parse(text); } catch(e) { body = text; }
+                    return {status: resp.status, body: body};
+                } catch(e) {
+                    return {error: e.message};
+                }
+            }""", [sign_url, token])
+
+            if isinstance(result, dict) and result.get("error"):
+                print(f"[datacarrier-sign] ERROR: Sign request failed: {result['error']}", flush=True)
+                return 1
+
+            status_code = result.get("status", 0) if isinstance(result, dict) else 0
+            body = result.get("body", {}) if isinstance(result, dict) else {}
+
+            if status_code != 200:
+                print(f"[datacarrier-sign] ERROR: Sign API returned HTTP {status_code}", flush=True)
+                if isinstance(body, dict):
+                    errors = body.get("errors", [])
+                    for e in errors:
+                        print(f"  {e.get('error', '')}: {e.get('message', '')}", flush=True)
+                return 1
+
+            # Extract signing state and poll info
+            sign_info = body.get("signInfo", {}) if isinstance(body, dict) else {}
+            state = sign_info.get("state") or body.get("state") or "?"
+            auth_req_id = body.get("authorizationRequestId") or "?"
+            poll_info = body.get("poll", {}) if isinstance(body, dict) else {}
+            poll_url = poll_info.get("url")
+            poll_interval = poll_info.get("interval", 3000)
+
+            print(f"[datacarrier-sign] Signing initiated: state={state} authReqId={auth_req_id}", flush=True)
+            print(f"[datacarrier-sign] Approve on your phone now!", flush=True)
 
             if output_dir:
                 ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
                 out_path = output_dir / f"datacarrier-sign.{datacarrier_id}.{ts}.json"
                 with open(out_path, "w") as f:
-                    json.dump(payload, f, indent=2, sort_keys=True)
+                    json.dump(body, f, indent=2, sort_keys=True)
                 print(f"[datacarrier-sign] Saved response: {out_path}", flush=True)
 
-            # If the first observed response was already the POST, reuse it.
-            post_response = response if (response and response.request.method == "POST") else None
+            # Poll for completion
+            if poll_url and args.timeout and args.timeout > 0:
+                interval_s = max(poll_interval / 1000.0, 1.0)
+                start = time.time()
+                last_state = state
 
-            # If the POST happened in the background (e.g. triggered by our earlier click), catch it.
-            if post_response is None:
-                try:
-                    post_response = page.wait_for_response(_is_sign_post, timeout=2000)
-                except Exception:
-                    post_response = None
+                while time.time() - start < args.timeout:
+                    time.sleep(interval_s)
+                    try:
+                        poll_result = page.evaluate("""async ([url, token]) => {
+                            try {
+                                const resp = await fetch(url, {
+                                    headers: {'Authorization': token}
+                                });
+                                const text = await resp.text();
+                                let body = null;
+                                try { body = JSON.parse(text); } catch(e) { body = text; }
+                                return {status: resp.status, body: body};
+                            } catch(e) {
+                                return {error: e.message};
+                            }
+                        }""", [poll_url, token])
 
-            # Otherwise trigger it explicitly.
-            if post_response is None:
-                try:
-                    with page.expect_response(_is_sign_post, timeout=10000) as resp_info:
-                        _click_confirmation_button(page)
-                    post_response = resp_info.value
-                except PlaywrightTimeout:
-                    post_response = None
+                        if isinstance(poll_result, dict) and not poll_result.get("error"):
+                            poll_body = poll_result.get("body", {})
+                            if isinstance(poll_body, dict):
+                                new_state = poll_body.get("state") or poll_body.get("status")
+                                if new_state and new_state != last_state:
+                                    print(f"[datacarrier-sign] state={new_state}", flush=True)
+                                    last_state = new_state
+                                if new_state and new_state not in ("PROCESSING", "PENDING", "OPEN"):
+                                    if new_state in ("DONE", "COMPLETED", "SIGNED"):
+                                        print(f"[datacarrier-sign] SUCCESS: Signing completed.", flush=True)
+                                    else:
+                                        print(f"[datacarrier-sign] Final state: {new_state}", flush=True)
+                                    break
+                    except Exception as e:
+                        # Page might have navigated; ignore poll errors
+                        pass
+                else:
+                    print(f"[datacarrier-sign] Timed out after {args.timeout}s waiting for approval.", flush=True)
+            elif not poll_url:
+                print(f"[datacarrier-sign] No poll URL returned. Check George app for status.", flush=True)
 
-            if post_response is None:
-                try:
-                    post_response = context.request.post(
-                        sign_api_url,
-                        data=json.dumps({"authorizationType": "GEORGE_TOKEN"}),
-                        headers={"Content-Type": "application/json"},
-                        timeout=30000,
-                    )
-                except Exception as e:
-                    print(f"[datacarrier-sign] ERROR: Signing request failed: {e}", flush=True)
-                    return 1
-
-            try:
-                post_payload = post_response.json() if post_response else None
-            except Exception:
-                try:
-                    post_payload = {"raw": post_response.text()} if post_response else None
-                except Exception:
-                    post_payload = {"raw": "<unparseable response>"} if post_response else None
-
-            auth_req_id = None
-            if isinstance(post_payload, dict):
-                auth_req_id = (
-                    post_payload.get("authorizationRequestId")
-                    or (post_payload.get("authorization") or {}).get("authorizationRequestId")
-                    or (post_payload.get("authorizationRequest") or {}).get("id")
-                )
-            sign_id, state = _extract_sign_state(post_payload if isinstance(post_payload, dict) else None)
-            sign_id = sign_id or _extract_sign_id_from_url(post_response.url if post_response else None)
-            id_part = f" id={datacarrier_id}"
-            sign_part = f" signId={sign_id}" if sign_id is not None else ""
-            state_part = f" state={state}" if state is not None else ""
-            auth_part = f" authReqId={auth_req_id}" if auth_req_id is not None else ""
-            print(f"[datacarrier-sign]{id_part}{sign_part}{state_part}{auth_part}", flush=True)
-
-            if args.timeout and args.timeout > 0:
-                try:
-                    thank_you = page.get_by_text("Thank you for signing.")
-                    thank_you.wait_for(timeout=args.timeout * 1000)
-                except Exception:
-                    pass
-
-                try:
-                    ok_clicked = _click_first_visible_button(
-                        page,
-                        [
-                            'button:has-text("OK")',
-                            'button:has-text("Ok")',
-                            'button:has-text("Okay")',
-                        ],
-                    )
-                    if ok_clicked:
-                        page.wait_for_url(re.compile(r".*#/datacarrier/dataCarrierList"), timeout=args.timeout * 1000)
-                except Exception:
-                    pass
         finally:
             context.close()
 
@@ -3755,7 +3840,27 @@ def main():
     transactions_parser.add_argument("--from", dest="date_from", required=True, help="Start date (YYYY-MM-DD)")
     transactions_parser.add_argument("--until", dest="date_until", required=True, help="End date (YYYY-MM-DD)")
     transactions_parser.set_defaults(func=cmd_transactions)
-    
+
+    dc_list_parser = subparsers.add_parser("datacarrier-list", help="List uploaded data-carrier files and orders")
+    dc_list_parser.add_argument("--json", action="store_true", help="Full JSON output")
+    dc_list_parser.add_argument("--state", default=None, help="Filter orders by state (e.g. OPEN, CLOSED)")
+    dc_list_parser.set_defaults(func=cmd_datacarrier_list)
+
+    dc_upload_parser = subparsers.add_parser("datacarrier-upload", help="Upload a data-carrier file (SEPA XML, CAMT, MT940)")
+    dc_upload_parser.add_argument("file", help="Path to the file to upload")
+    dc_upload_parser.add_argument("--type", default=None, help="Override file type hint (e.g. pain.001, camt.053)")
+    dc_upload_parser.add_argument("--out", dest="output", default=None, help="Directory to save the upload response JSON")
+    dc_upload_parser.add_argument("--wait-done", action="store_true", default=False, help="Poll until file reaches DONE state")
+    dc_upload_parser.add_argument("--wait-done-timeout", type=int, default=120, help="Timeout in seconds for --wait-done (default: 120)")
+    dc_upload_parser.set_defaults(func=cmd_datacarrier_upload)
+
+    dc_sign_parser = subparsers.add_parser("datacarrier-sign", help="Sign a data-carrier upload")
+    dc_sign_parser.add_argument("datacarrier_id", help="Data-carrier file id to sign")
+    dc_sign_parser.add_argument("--sign-id", default=None, help="Skip UI discovery and use this signId directly")
+    dc_sign_parser.add_argument("--out", dest="output", default=None, help="Directory to save the signing response JSON")
+    dc_sign_parser.add_argument("--timeout", type=int, default=120, help="Seconds to wait for phone approval (default: 120)")
+    dc_sign_parser.set_defaults(func=cmd_datacarrier_sign)
+
     args = parser.parse_args()
     _apply_state_dir()
 
