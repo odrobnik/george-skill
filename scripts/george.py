@@ -184,6 +184,7 @@ def _default_output_dir() -> Path:
 # Runtime state dir (always workspace/george)
 STATE_DIR: Path = _default_state_dir()
 DEFAULT_OUTPUT_DIR: Path = _default_output_dir()
+CONFIG_PATH: Path = STATE_DIR / "config.json"
 
 DEBUG_DIR: Path = STATE_DIR / "debug"
 
@@ -199,6 +200,56 @@ def _get_profile_dir(user_id: str) -> Path:
 
 def _get_token_cache_file(user_id: str) -> Path:
     return _get_profile_dir(user_id) / "token.json"
+
+
+def _load_config_user_id() -> str | None:
+    """Best-effort: read the default George user id from config.json."""
+    try:
+        if not CONFIG_PATH.exists():
+            return None
+        data = json.loads(CONFIG_PATH.read_text())
+        user_id = data.get("user_id") if isinstance(data, dict) else None
+        if isinstance(user_id, str) and user_id.strip():
+            return user_id.strip()
+    except Exception:
+        return None
+    return None
+
+
+def _discover_recent_profile_user_id() -> str | None:
+    """Best-effort: pick the most recently used George profile from STATE_DIR."""
+    try:
+        candidates: list[tuple[float, str]] = []
+        if not STATE_DIR.exists():
+            return None
+        for entry in STATE_DIR.iterdir():
+            if not entry.is_dir():
+                continue
+            name = entry.name
+            if not name.startswith(".pw-profile-"):
+                continue
+            suffix = name.removeprefix(".pw-profile-").strip()
+            if not suffix or suffix in {"v2"}:
+                continue
+
+            score = 0.0
+            token_file = entry / "token.json"
+            try:
+                if token_file.exists():
+                    score = token_file.stat().st_mtime
+                else:
+                    score = entry.stat().st_mtime
+            except Exception:
+                score = 0.0
+            candidates.append((score, suffix))
+
+        if not candidates:
+            return None
+
+        candidates.sort(reverse=True)
+        return candidates[0][1]
+    except Exception:
+        return None
 
 # George URLs
 BASE_URL = "https://george.sparkasse.at"
@@ -1948,10 +1999,11 @@ def upload_datacarrier_file(page, file_path: Path, file_type: str | None = None)
         'button[type="submit"]',
     ]
 
-    # Find the file input
+    # Find the file input (may be hidden in new George UI)
     try:
         file_input = page.locator('input[type="file"]')
-        file_input.wait_for(timeout=30000)
+        # Don't wait for visibility - just check it exists in DOM
+        file_input.wait_for(state="attached", timeout=30000)
     except Exception as e:
         print(f"[datacarrier-upload] ERROR: Could not find file input: {e}", flush=True)
         return None
@@ -2258,7 +2310,8 @@ def _resolve_user_id(args) -> str:
     Precedence:
     1) --user-id (explicit)
     2) GEORGE_USER_ID from environment
-
+    3) george/config.json user_id
+    4) most recently used Playwright George profile in george/
     """
     if getattr(args, "user_id", None):
         return str(args.user_id).strip()
@@ -2267,10 +2320,22 @@ def _resolve_user_id(args) -> str:
     if env_uid and env_uid.strip():
         return env_uid.strip()
 
+    config_uid = _load_config_user_id()
+    if config_uid:
+        print(f"[george] Using configured user id from {CONFIG_PATH}: {config_uid}", flush=True)
+        return config_uid
+
+    recent_uid = _discover_recent_profile_user_id()
+    if recent_uid:
+        print(f"[george] Using most recent George profile: {recent_uid}", flush=True)
+        return recent_uid
+
     raise ValueError(
-        "No user id configured. Provide one of:\n"
+        "No user id configured. Tried, in order:\n"
         "- --user-id <your-user-number-or-username>\n"
-        "- set GEORGE_USER_ID env var"
+        "- GEORGE_USER_ID env var\n"
+        f"- {CONFIG_PATH}\n"
+        f"- George profiles in {STATE_DIR}"
     )
 
 
