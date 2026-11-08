@@ -1973,10 +1973,20 @@ def _try_select_datacarrier_type(page, file_type: str) -> None:
         pass
 
 
+_DATACARRIER_SELECT_BUTTON = re.compile(r"select a file|datei ausw", re.I)
+_DATACARRIER_IMPORT_BUTTON = re.compile(r"^\s*(import|importieren)\s*$", re.I)
+_DATACARRIER_OK_BUTTON = re.compile(r"^\s*ok\s*$", re.I)
+# Skip the hidden image-upload inputs ("Change image") that George has on many pages.
+_DATACARRIER_FILE_INPUT = 'input[type="file"]:not([accept*="image/"]):not([data-cy="image-upload-file-input"])'
+
+
 def upload_datacarrier_file(page, file_path: Path, file_type: Optional[str] = None) -> Optional[dict]:
-    print(f"[datacarrier-upload] Opening upload page...", flush=True)
-    page.goto(DATACARRIER_UPLOAD_URL, wait_until="domcontentloaded")
-    time.sleep(2)
+    select_button = page.get_by_role("button", name=_DATACARRIER_SELECT_BUTTON)
+    # After the previous file's OK click the form is already showing; don't navigate again.
+    if select_button.count() == 0 and page.locator(_DATACARRIER_FILE_INPUT).count() == 0:
+        print(f"[datacarrier-upload] Opening upload page...", flush=True)
+        page.goto(DATACARRIER_UPLOAD_URL, wait_until="domcontentloaded")
+        time.sleep(2)
     dismiss_modals(page)
 
     if file_type:
@@ -2000,27 +2010,68 @@ def upload_datacarrier_file(page, file_path: Path, file_type: Optional[str] = No
         'button[type="submit"]',
     ]
 
-    # Find the file input (may be hidden in new George UI)
+    # Pick the file via "Or select a file", as a user does; else use the (hidden) file input.
+    chooser = None
     try:
-        file_input = page.locator('input[type="file"]')
-        # Don't wait for visibility - just check it exists in DOM
-        file_input.wait_for(state="attached", timeout=30000)
-    except Exception as e:
-        print(f"[datacarrier-upload] ERROR: Could not find file input: {e}", flush=True)
-        return None
+        with page.expect_file_chooser(timeout=10000) as chooser_info:
+            select_button.first.click(timeout=10000)
+        chooser = chooser_info.value
+    except Exception:
+        try:
+            file_input = page.locator(_DATACARRIER_FILE_INPUT)
+            # Don't wait for visibility - just check it exists in DOM
+            file_input.wait_for(state="attached", timeout=30000)
+        except Exception as e:
+            print(f"[datacarrier-upload] ERROR: Could not find file input: {e}", flush=True)
+            return None
 
-    response = None
+    settled = []  # requests the browser reported as finished or failed
+
+    def _on_settled(request) -> None:
+        settled.append(request)
+
+    page.on("requestfinished", _on_settled)
+    page.on("requestfailed", _on_settled)
     try:
-        with page.expect_response(_is_datacarrier_response, timeout=120000) as resp_info:
-            file_input.set_input_files(str(file_path))
-            clicked = _click_first_visible_button(page, upload_buttons)
-            if not clicked:
-                # Some UIs auto-upload after file selection
-                pass
-        response = resp_info.value
-    except PlaywrightTimeout:
-        print("[datacarrier-upload] ERROR: Timed out waiting for upload response", flush=True)
-        return None
+        try:
+            with page.expect_response(_is_datacarrier_response, timeout=120000) as resp_info:
+                if chooser:
+                    chooser.set_files(str(file_path))
+                else:
+                    file_input.set_input_files(str(file_path))
+                # George's own "Import" button; the generic list is the fallback for other UIs.
+                import_button = page.get_by_role("button", name=_DATACARRIER_IMPORT_BUTTON)
+                if import_button.count() > 0:
+                    import_button.first.click()
+                    clicked = True
+                else:
+                    clicked = _click_first_visible_button(page, upload_buttons)
+                if not clicked:
+                    # Some UIs auto-upload after file selection
+                    pass
+            response = resp_info.value
+        except PlaywrightTimeout:
+            print("[datacarrier-upload] ERROR: Timed out waiting for upload response", flush=True)
+            return None
+
+        # Close the "Thank you for your data import" screen so the form is ready for the next file.
+        try:
+            page.get_by_role("button", name=_DATACARRIER_OK_BUTTON).first.click(timeout=10000)
+            page.wait_for_timeout(500)
+        except Exception:
+            pass
+
+        # response.json() first waits, without a timeout, until the browser reports the request
+        # as finished. George's upload request does not always get that report, which hung the
+        # upload forever. Read the body only once it has; otherwise return the HTTP status.
+        deadline = time.time() + 10
+        while response.request not in settled and time.time() < deadline:
+            page.wait_for_timeout(200)
+        if response.request not in settled:
+            return {"status": response.status}
+    finally:
+        page.remove_listener("requestfinished", _on_settled)
+        page.remove_listener("requestfailed", _on_settled)
 
     try:
         return response.json()
@@ -2829,8 +2880,35 @@ def cmd_datacarrier_list(args):
     return 0
 
 
+def _wait_for_datacarrier_done(context, resp_id, timeout_s: int) -> None:
+    """Poll the datacarrier-files list until the given file id reaches DONE (or timeout)."""
+    print(f"[datacarrier-upload] Waiting for file id={resp_id} to reach DONE...", flush=True)
+    last_state = None
+    start = time.time()
+    timeout_s = max(int(timeout_s or 0), 0)
+    while True:
+        if timeout_s > 0 and time.time() - start > timeout_s:
+            print(f"[datacarrier-upload] Timed out after {timeout_s}s waiting for DONE", flush=True)
+            break
+        try:
+            resp = context.request.get(_build_datacarrier_files_list_url(), timeout=30000)
+            payload = resp.json()
+        except Exception as e:
+            print(f"[datacarrier-upload] Polling error: {e}", flush=True)
+            time.sleep(3)
+            continue
+
+        state, _item = _extract_datacarrier_file_state(payload, resp_id)
+        if state and state != last_state:
+            print(f"[datacarrier-upload] State={state}", flush=True)
+            last_state = state
+        if state == "DONE":
+            break
+        time.sleep(3)
+
+
 def cmd_datacarrier_upload(args):
-    """Upload a data-carrier file."""
+    """Upload one or more data-carrier files in a single George session."""
     try:
         user_id = _resolve_user_id(args)
     except Exception as e:
@@ -2841,20 +2919,31 @@ def cmd_datacarrier_upload(args):
     global USER_ID_OVERRIDE
     USER_ID_OVERRIDE = user_id
 
-    file_path = Path(args.file).expanduser().resolve()
-    if not file_path.exists() or not file_path.is_file():
-        print(f"[datacarrier-upload] ERROR: File not found: {file_path}", flush=True)
-        return 1
+    # Validate every file before logging in, so a bad argument never leaves a half-uploaded batch.
+    file_paths: list[Path] = []
+    for raw_path in args.files:
+        file_path = Path(raw_path).expanduser().resolve()
+        if not file_path.exists() or not file_path.is_file():
+            print(f"[datacarrier-upload] ERROR: File not found: {file_path}", flush=True)
+            return 1
 
-    try:
-        _validate_upload_file(file_path)
-    except ValueError as e:
-        print(f"[datacarrier-upload] ERROR: {e}", flush=True)
-        return 1
+        try:
+            _validate_upload_file(file_path)
+        except ValueError as e:
+            print(f"[datacarrier-upload] ERROR: {e}", flush=True)
+            return 1
+
+        if file_path in file_paths:
+            print(f"[datacarrier-upload] ERROR: File given more than once: {file_path}", flush=True)
+            return 1
+        file_paths.append(file_path)
 
     output_dir = Path(args.output) if args.output else None
     if output_dir:
         output_dir.mkdir(parents=True, exist_ok=True)
+
+    uploaded: list[Path] = []
+    failed: Optional[Path] = None
 
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
@@ -2870,64 +2959,56 @@ def cmd_datacarrier_upload(args):
                 return 1
 
             dismiss_modals(page)
-            payload = upload_datacarrier_file(page, file_path, args.type)
-            if payload is None:
-                return 1
+            for index, file_path in enumerate(file_paths, start=1):
+                if len(file_paths) > 1:
+                    print(f"[datacarrier-upload] File {index}/{len(file_paths)}: {file_path.name}", flush=True)
 
-            resp_id = None
-            resp_status = None
-            if isinstance(payload, dict):
-                resp_id = (
-                    payload.get("id")
-                    or payload.get("fileId")
-                    or payload.get("uuid")
-                    or payload.get("reference")
-                    or payload.get("datacarrierFileId")
-                )
-                resp_status = payload.get("status") or payload.get("state") or payload.get("result")
+                payload = upload_datacarrier_file(page, file_path, args.type)
+                if payload is None:
+                    failed = file_path
+                    break
 
-            id_part = f" id={resp_id}" if resp_id is not None else ""
-            status_part = f" status={resp_status}" if resp_status is not None else ""
-            print(f"[datacarrier-upload] Uploaded {file_path.name}{id_part}{status_part}", flush=True)
+                resp_id = None
+                resp_status = None
+                if isinstance(payload, dict):
+                    resp_id = (
+                        payload.get("id")
+                        or payload.get("fileId")
+                        or payload.get("uuid")
+                        or payload.get("reference")
+                        or payload.get("datacarrierFileId")
+                    )
+                    resp_status = payload.get("status") or payload.get("state") or payload.get("result")
 
-            if output_dir:
-                ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-                out_path = output_dir / f"{file_path.name}.datacarrier.{ts}.json"
-                with open(out_path, "w") as f:
-                    json.dump(payload, f, indent=2, sort_keys=True)
-                print(f"[datacarrier-upload] Saved response: {out_path}", flush=True)
+                id_part = f" id={resp_id}" if resp_id is not None else ""
+                status_part = f" status={resp_status}" if resp_status is not None else ""
+                print(f"[datacarrier-upload] Uploaded {file_path.name}{id_part}{status_part}", flush=True)
+                uploaded.append(file_path)
 
-            if args.wait_done:
-                if resp_id is None:
-                    print("[datacarrier-upload] --wait-done requested but upload response has no file id", flush=True)
-                else:
-                    print(f"[datacarrier-upload] Waiting for file id={resp_id} to reach DONE...", flush=True)
-                    last_state = None
-                    start = time.time()
-                    timeout_s = max(int(getattr(args, "wait_done_timeout", 120) or 0), 0)
-                    while True:
-                        if timeout_s > 0 and time.time() - start > timeout_s:
-                            print(f"[datacarrier-upload] Timed out after {timeout_s}s waiting for DONE", flush=True)
-                            break
-                        try:
-                            resp = context.request.get(_build_datacarrier_files_list_url(), timeout=30000)
-                            payload = resp.json()
-                        except Exception as e:
-                            print(f"[datacarrier-upload] Polling error: {e}", flush=True)
-                            time.sleep(3)
-                            continue
+                if output_dir:
+                    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+                    out_path = output_dir / f"{file_path.name}.datacarrier.{ts}.json"
+                    with open(out_path, "w") as f:
+                        json.dump(payload, f, indent=2, sort_keys=True)
+                    print(f"[datacarrier-upload] Saved response: {out_path}", flush=True)
 
-                        state, _item = _extract_datacarrier_file_state(payload, resp_id)
-                        if state and state != last_state:
-                            print(f"[datacarrier-upload] State={state}", flush=True)
-                            last_state = state
-                        if state == "DONE":
-                            break
-                        time.sleep(3)
+                if args.wait_done:
+                    if resp_id is None:
+                        print("[datacarrier-upload] --wait-done requested but upload response has no file id", flush=True)
+                    else:
+                        _wait_for_datacarrier_done(context, resp_id, getattr(args, "wait_done_timeout", 120))
         finally:
             context.close()
 
-    return 0
+    if len(file_paths) > 1:
+        not_attempted = file_paths[len(uploaded) + (1 if failed else 0):]
+        print(f"[datacarrier-upload] Summary: {len(uploaded)}/{len(file_paths)} uploaded", flush=True)
+        if failed:
+            print(f"[datacarrier-upload]   failed: {failed.name}", flush=True)
+        for file_path in not_attempted:
+            print(f"[datacarrier-upload]   not attempted: {file_path.name}", flush=True)
+
+    return 1 if failed else 0
 
 
 def cmd_datacarrier_sign(args):
@@ -3979,8 +4060,8 @@ def main():
     dc_list_parser.add_argument("--state", default=None, help="Filter orders by state (e.g. OPEN, CLOSED)")
     dc_list_parser.set_defaults(func=cmd_datacarrier_list)
 
-    dc_upload_parser = subparsers.add_parser("datacarrier-upload", help="Upload a data-carrier file (SEPA XML, CAMT, MT940)")
-    dc_upload_parser.add_argument("file", help="Path to the file to upload")
+    dc_upload_parser = subparsers.add_parser("datacarrier-upload", help="Upload one or more data-carrier files (SEPA XML, CAMT, MT940)")
+    dc_upload_parser.add_argument("files", nargs="+", metavar="file", help="Path(s) to the file(s) to upload, in one session")
     dc_upload_parser.add_argument("--type", default=None, help="Override file type hint (e.g. pain.001, camt.053)")
     dc_upload_parser.add_argument("--out", dest="output", default=None, help="Directory to save the upload response JSON")
     dc_upload_parser.add_argument("--wait-done", action="store_true", default=False, help="Poll until file reaches DONE state")
