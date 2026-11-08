@@ -2063,6 +2063,28 @@ def _build_datacarrier_files_list_url() -> str:
     return f"{DATACARRIER_FILES_API_URL}?page=0&size=100"
 
 
+def _dedupe_by_id(items: list) -> list:
+    """Keep one entry per "id": first position, latest payload.
+
+    The datacarrier page requests the same lists more than once, so captured
+    responses contain each file/order several times. Items without an id are kept as-is.
+    """
+    result: list = []
+    index_by_id: dict = {}
+    for item in items:
+        item_id = item.get("id") if isinstance(item, dict) else None
+        if item_id is None:
+            result.append(item)
+            continue
+        key = str(item_id)
+        if key in index_by_id:
+            result[index_by_id[key]] = item
+        else:
+            index_by_id[key] = len(result)
+            result.append(item)
+    return result
+
+
 def _extract_datacarrier_file_state(payload, file_id: Optional[Union[str, int]]) -> tuple[Optional[str], Optional[dict]]:
     if file_id is None:
         return None, None
@@ -2774,6 +2796,9 @@ def cmd_datacarrier_list(args):
             page.goto(DATACARRIER_UPLOAD_URL, wait_until="domcontentloaded")
             page.wait_for_load_state("networkidle")
             time.sleep(2)  # Allow XHR to complete
+
+            captured_files = _dedupe_by_id(captured_files)
+            captured_orders = _dedupe_by_id(captured_orders)
 
             # Apply state filter to orders
             if state_filter:
