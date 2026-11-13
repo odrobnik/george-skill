@@ -16,6 +16,7 @@ sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
 import argparse
+import html
 import json
 import os
 import re
@@ -3141,6 +3142,547 @@ def cmd_datacarrier_sign(args):
 
 
 
+# ---------------------------------------------------------------------------
+# Single SEPA transfer
+# ---------------------------------------------------------------------------
+# Endpoints and payloads are the ones George's own transfer form uses (taken from live
+# transfers): AT receivers go to /domestic, other SEPA receivers to /sepa with the sender's BIC.
+PAYMENTS_API_URL = "https://api.sparkasse.at/rest/netbanking/my/orders/payments"
+PAYEE_VERIFICATION_URL = (
+    "https://api.sparkasse.at/proxy/ggw/payment/public/payment-initiations/validation/payee-verification"
+)
+ADDRESSBOOK_URL = "https://api.sparkasse.at/proxy/g/api/my/addressbook/contacts"
+
+# EU/EEA countries: SEPA transfers there need only IBAN and name (no BIC, no address).
+# Other SEPA countries (CH, GB, ...) need more fields, which this command doesn't send.
+EEA_IBAN_COUNTRIES = frozenset(
+    "AT BE BG CY CZ DE DK EE ES FI FR GR HR HU IE IS IT LI LT LU LV MT NL NO PL PT RO SE SI SK".split()
+)
+
+
+def _normalize_iban(value: Optional[str]) -> str:
+    return re.sub(r"\s+", "", value or "").upper()
+
+
+def _iban_checksum_ok(iban: str) -> bool:
+    if not re.fullmatch(r"[A-Z]{2}\d{2}[A-Z0-9]{10,30}", iban):
+        return False
+    digits = "".join(str(int(c, 36)) for c in iban[4:] + iban[:4])
+    return int(digits) % 97 == 1
+
+
+def _check_receiver(iban: str, name: str) -> None:
+    if not _iban_checksum_ok(iban):
+        raise ValueError(f"Invalid IBAN: {_format_iban(iban)}")
+    if iban[:2] not in EEA_IBAN_COUNTRIES:
+        raise ValueError(f"IBANs from {iban[:2]} aren't supported; only EU/EEA countries are.")
+    if not 0 < len(name) <= 70:
+        raise ValueError("Recipient name must be 1 to 70 characters")
+
+
+def _find_bic(payload, iban: str) -> Optional[str]:
+    """The BIC George lists next to `iban` in its raw account data, if any."""
+    if isinstance(payload, list):
+        for item in payload:
+            found = _find_bic(item, iban)
+            if found:
+                return found
+    elif isinstance(payload, dict):
+        own_iban = next((v for k, v in payload.items() if "iban" in k.lower() and isinstance(v, str)), None)
+        bic = next((v for k, v in payload.items() if k.lower() in ("bic", "swift", "bicswift") and isinstance(v, str)), None)
+        if own_iban and _normalize_iban(own_iban) == iban and bic and bic.strip():
+            return bic.strip()
+        for value in payload.values():
+            if isinstance(value, (dict, list)):
+                found = _find_bic(value, iban)
+                if found:
+                    return found
+    return None
+
+
+def _parse_amount_cents(value: str) -> int:
+    text = (value or "").strip().replace(",", ".")
+    if not re.fullmatch(r"\d+(\.\d{1,2})?", text):
+        raise ValueError(f"Invalid amount {value!r}: use e.g. 12.34 (at most 2 decimals)")
+    whole, _, frac = text.partition(".")
+    cents = int(whole) * 100 + int((frac + "00")[:2])
+    if cents <= 0:
+        raise ValueError("Amount must be greater than 0")
+    return cents
+
+
+def _find_sender_account(accounts: list[dict], key: str) -> dict:
+    """Pick the sender account by exact id, exact IBAN, exact name, or a unique partial name match."""
+    q = " ".join((key or "").split()).lower()
+    with_iban = [a for a in accounts if a.get("iban")]
+    for acc in with_iban:
+        if str(acc.get("id") or "").lower() == q or _normalize_iban(acc["iban"]) == _normalize_iban(key):
+            return acc
+    fields = ("name", "alias", "description")
+    matches = [
+        acc for acc in with_iban
+        if q and any(" ".join(str(acc.get(k) or "").split()).lower() == q for k in fields)
+    ] or [
+        acc for acc in with_iban
+        if q and any(q in str(acc.get(k) or "").lower() for k in fields)
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise ValueError(f"No account with an IBAN matches {key!r}. Run 'accounts' to list them.")
+    names = ", ".join(f"{a.get('name')} ({_short_iban(a.get('iban'))})" for a in matches)
+    raise ValueError(f"{key!r} matches several accounts: {names}")
+
+
+_CONTACT_NAME_KEYS = ("name", "displayName", "fullName", "accountHolderName", "holderName", "partnerName")
+_CONTACT_LABEL_KEYS = ("alias", "nickname", "nickName", "label", "description")
+
+
+def _clean(value) -> str:
+    return " ".join(html.unescape(value).split()) if isinstance(value, str) else ""
+
+
+def _contact_name(node: dict) -> str:
+    for key in _CONTACT_NAME_KEYS:
+        if _clean(node.get(key)):
+            return _clean(node.get(key))
+    return " ".join(x for x in (_clean(node.get("firstName")), _clean(node.get("lastName"))) if x)
+
+
+def _addressbook_entries(payload) -> list[dict]:
+    """Flatten George's address book into one {name, label, iban} entry per contact IBAN.
+
+    `name` is the contact's name (the outermost name above the IBAN), used as the recipient
+    name. `label` is an alias, nickname or account name below it, if there is one.
+    """
+    entries: list[dict] = []
+    seen: set = set()
+
+    def walk(node, name: str, label: str) -> None:
+        if isinstance(node, list):
+            for item in node:
+                walk(item, name, label)
+            return
+        if not isinstance(node, dict):
+            return
+        own_name = _contact_name(node)
+        if not name:
+            name = own_name
+        elif own_name and own_name != name:
+            label = own_name
+        label = next((_clean(node[k]) for k in _CONTACT_LABEL_KEYS if _clean(node.get(k))), label)
+        for key, value in node.items():
+            if "iban" in key.lower() and isinstance(value, str):
+                iban = _normalize_iban(value)
+                if name and _iban_checksum_ok(iban) and (name, iban) not in seen:
+                    seen.add((name, iban))
+                    entries.append({"name": name, "label": label, "iban": iban})
+            elif isinstance(value, (dict, list)):
+                walk(value, name, label)
+
+    walk(payload, "", "")
+    return entries
+
+
+def _json_keys(value, depth: int = 4):
+    """Field names of a JSON value without any values (for error messages)."""
+    if depth <= 0:
+        return "..."
+    if isinstance(value, dict):
+        return {k: _json_keys(v, depth - 1) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_keys(value[0], depth - 1)] if value else []
+    return type(value).__name__
+
+
+def _page_count(body) -> Optional[int]:
+    if isinstance(body, dict):
+        for key in ("pageCount", "totalPages"):
+            if isinstance(body.get(key), int):
+                return body[key]
+    return None
+
+
+def _fetch_addressbook(page, auth_header: str, prefix: str) -> Optional[list[dict]]:
+    """Read all pages of the address book (George returns 20 contacts per page by default)."""
+    entries: list[dict] = []
+    seen: set = set()
+    first_body = None
+    for page_no in range(100):
+        status, body = _george_api(page, "GET", f"{ADDRESSBOOK_URL}?page={page_no}&size=100", auth_header)
+        if status != 200 and page_no == 0:
+            # Maybe George doesn't take paging parameters here: try the plain URL once.
+            status, body = _george_api(page, "GET", ADDRESSBOOK_URL, auth_header)
+            if status != 200:
+                _print_api_error(prefix, "Reading the address book", status, body)
+                return None
+            entries = _addressbook_entries(body)
+            first_body = body
+            break
+        if status != 200:
+            _print_api_error(prefix, f"Reading address book page {page_no + 1}", status, body)
+            return None
+        if first_body is None:
+            first_body = body
+        new = [e for e in _addressbook_entries(body) if (e["name"], e["iban"]) not in seen]
+        if not new:
+            break  # an empty page, or George ignored the page number and sent page 1 again
+        seen.update((e["name"], e["iban"]) for e in new)
+        entries.extend(new)
+        count = _page_count(body)
+        if count is not None and page_no + 1 >= count:
+            break
+    if not entries and first_body:
+        print(f"{prefix} The address book has no entries with an IBAN that this command understands. "
+              f"Fields: {json.dumps(_json_keys(first_body))[:500]}", flush=True)
+    elif len(entries) % 20 == 0 and _page_count(first_body) is None and isinstance(first_body, dict):
+        # A multiple of 20 may mean a page limit this code doesn't know. Show field names only.
+        top = {k: (v if isinstance(v, (int, bool)) else type(v).__name__) for k, v in first_body.items()}
+        print(f"{prefix} Note: {len(entries)} entries, maybe not all. Response fields: "
+              f"{json.dumps(top)[:300]}", flush=True)
+    return entries
+
+
+def _find_contact(entries: list[dict], key: str) -> dict:
+    """Pick an address book entry by a unique name/label match, or an exact IBAN."""
+    q = " ".join((key or "").split()).lower()
+    by_iban = [e for e in entries if e["iban"] == _normalize_iban(key)]
+    exact = [e for e in entries if q in (e["name"].lower(), e["label"].lower())]
+    matches = by_iban or exact or [e for e in entries if q and (q in e["name"].lower() or q in e["label"].lower())]
+    if len({e["iban"] for e in matches}) == 1:
+        return matches[0]
+    if not matches:
+        raise ValueError(f"No address book contact matches {key!r}. Run 'contacts' to list them.")
+    found = ", ".join(f"{e['name']}{' / ' + e['label'] if e['label'] else ''} ({_short_iban(e['iban'])})"
+                      for e in matches)
+    raise ValueError(f"{key!r} matches several contacts: {found}")
+
+
+def _george_api(page, method: str, url: str, auth_header: str, body=None) -> tuple[int, object]:
+    """Call a George API from the logged-in page, the same way George's own frontend does."""
+    result = page.evaluate("""async ([method, url, token, body]) => {
+        try {
+            const opts = {method: method, headers: {'Authorization': token}};
+            if (body !== null) {
+                opts.headers['Content-Type'] = 'application/json';
+                opts.body = JSON.stringify(body);
+            }
+            const resp = await fetch(url, opts);
+            const text = await resp.text();
+            let parsed = null;
+            try { parsed = JSON.parse(text); } catch (e) { parsed = text; }
+            return {status: resp.status, body: parsed};
+        } catch (e) {
+            return {status: 0, body: String((e && e.message) || e)};
+        }
+    }""", [method, url, auth_header, body])
+    return int(result.get("status") or 0), result.get("body")
+
+
+def _print_api_error(prefix: str, what: str, status: int, body) -> None:
+    print(f"{prefix} ERROR: {what} failed (HTTP {status})", flush=True)
+    errors = body.get("errors") if isinstance(body, dict) else None
+    if isinstance(errors, list) and errors:
+        for err in errors:
+            print(f"{prefix}   {json.dumps(err, ensure_ascii=False)}", flush=True)
+    elif body:
+        print(f"{prefix}   {str(body)[:300]}", flush=True)
+
+
+def _transfer_date_like(template: str, day: date) -> str:
+    """Write `day` in the format George used in `template` (date only, or date plus time)."""
+    if re.match(r"\d{4}-\d{2}-\d{2}", template or ""):
+        return day.isoformat() + template[10:]
+    return day.isoformat()
+
+
+def _print_transfer_summary(prefix: str, order: dict, sender: dict) -> None:
+    amount = order.get("amount") or {}
+    value = (amount.get("value") or 0) / (10 ** (amount.get("precision") or 2))
+    texts = (order.get("additionalInfo") or {}).get("text4x35") or []
+    text = " ".join(t.strip() for t in texts if isinstance(t, str) and t.strip())
+    payee_check = (order.get("payeeVerificationResult") or {}).get("result")
+    print(f"{prefix} Order created (id={order.get('id')}):", flush=True)
+    print(f"{prefix}   From:    {order.get('senderName') or sender.get('name')} "
+          f"({_format_iban(_normalize_iban((order.get('sender') or {}).get('iban')))})", flush=True)
+    print(f"{prefix}   To:      {order.get('receiverName')} "
+          f"({_format_iban(_normalize_iban((order.get('receiver') or {}).get('iban')))})", flush=True)
+    print(f"{prefix}   Amount:  {value:.2f} {amount.get('currency') or ''}", flush=True)
+    print(f"{prefix}   Date:    {str(order.get('transferDate') or '')[:10] or 'right away'}", flush=True)
+    print(f"{prefix}   Text:    {text or '-'}", flush=True)
+    print(f"{prefix}   Type:    {'instant' if order.get('orderType') == 'INSTANT_PAYMENT_OUT' else 'standard'}"
+          f" | state={order.get('state')} | payee check={payee_check or '-'}", flush=True)
+
+
+def cmd_contacts(args):
+    """List the George address book (name, label, IBAN). Read-only."""
+    prefix = "[contacts]"
+    try:
+        user_id = _resolve_user_id(args)
+    except Exception as e:
+        print(f"{prefix} ERROR: {e}", flush=True)
+        return 1
+    global USER_ID_OVERRIDE
+    USER_ID_OVERRIDE = user_id
+
+    with sync_playwright() as p:
+        context = p.chromium.launch_persistent_context(
+            user_data_dir=str(_get_profile_dir(user_id)),
+            headless=not args.visible,
+            viewport={"width": 1280, "height": 900},
+        )
+        page = context.new_page()
+        try:
+            if not login(page, timeout_seconds=_login_timeout(args)):
+                return 1
+            dismiss_modals(page)
+            auth = capture_bearer_auth_header(context, page, timeout_s=10)
+            if not auth:
+                print(f"{prefix} ERROR: Could not capture the George API token", flush=True)
+                return 1
+            entries = _fetch_addressbook(page, auth, prefix)
+            if entries is None:
+                return 1
+        finally:
+            context.close()
+
+    if args.json:
+        print(json.dumps(entries, ensure_ascii=False, indent=2))
+        return 0
+    print(f"{prefix} {len(entries)} address book entries with an IBAN:", flush=True)
+    for e in entries:
+        label = f" / {e['label']}" if e["label"] else ""
+        print(f"{prefix}   {e['name']}{label}: {_format_iban(e['iban'])}", flush=True)
+    return 0
+
+
+def cmd_transfer(args):
+    """Create a single SEPA transfer to an EU/EEA IBAN; sign it only with --sign.
+
+    Flow (same API calls as George's transfer form):
+    1. Check the inputs offline (IBAN checksum and country, amount, text, date)
+    2. Login, capture the API token, find the sender account (and the address book contact)
+    3. Payee verification: does the name match the IBAN's account holder?
+    4. Ask George for the earliest booking date, create the order (state OPEN)
+    5. With --sign: confirm, POST the sign request, wait for the phone approval
+    """
+    prefix = "[transfer]"
+    try:
+        user_id = _resolve_user_id(args)
+        receiver_name = " ".join((args.to_name or "").split())
+        receiver_iban = ""
+        if args.to_iban:
+            if not receiver_name:
+                raise ValueError("--to-iban needs --to-name")
+            receiver_iban = _normalize_iban(args.to_iban)
+            _check_receiver(receiver_iban, receiver_name)
+        cents = _parse_amount_cents(args.amount)
+        text = " ".join((args.text or "").split())
+        if len(text) > 140:
+            raise ValueError("Text must be at most 140 characters")
+        day = datetime.strptime(args.date, "%Y-%m-%d").date() if args.date else None
+        if day and day < date.today():
+            raise ValueError(f"Date {day} is in the past")
+    except ValueError as e:
+        print(f"{prefix} ERROR: {e}", flush=True)
+        return 1
+
+    if args.sign and not args.yes and not sys.stdin.isatty():
+        print(f"{prefix} ERROR: --sign asks for confirmation in the terminal; use --yes when there is none "
+              "(the phone approval is still required).", flush=True)
+        return 1
+
+    profile_dir = _get_profile_dir(user_id)
+    global USER_ID_OVERRIDE
+    USER_ID_OVERRIDE = user_id
+
+    order_type = "INSTANT_PAYMENT_OUT" if args.instant else "PAYMENT_OUT"
+    amount = {"value": cents, "precision": 2, "currency": "EUR"}
+
+    with sync_playwright() as p:
+        context = p.chromium.launch_persistent_context(
+            user_data_dir=str(profile_dir),
+            headless=not args.visible,
+            viewport={"width": 1280, "height": 900},
+        )
+        context.on("dialog", lambda d: d.accept())
+        page = context.new_page()
+
+        try:
+            if not login(page, timeout_seconds=_login_timeout(args)):
+                return 1
+            dismiss_modals(page)
+
+            auth = capture_bearer_auth_header(context, page, timeout_s=10)
+            if not auth:
+                print(f"{prefix} ERROR: Could not capture the George API token", flush=True)
+                return 1
+
+            try:
+                raw_accounts = fetch_my_accounts(context, auth)
+                accounts = normalize_accounts_from_api(raw_accounts)
+                sender = _find_sender_account(accounts, args.from_account)
+            except Exception as e:
+                print(f"{prefix} ERROR: {e}", flush=True)
+                return 1
+            sender_iban = _normalize_iban(sender["iban"])
+
+            if args.to_contact:
+                entries = _fetch_addressbook(page, auth, prefix)
+                if entries is None:
+                    return 1
+                try:
+                    contact = _find_contact(entries, args.to_contact)
+                    receiver_iban = contact["iban"]
+                    receiver_name = receiver_name or contact["name"][:70]
+                    _check_receiver(receiver_iban, receiver_name)
+                except ValueError as e:
+                    print(f"{prefix} ERROR: {e}", flush=True)
+                    return 1
+                label = f" / {contact['label']}" if contact["label"] else ""
+                print(f"{prefix} Contact: {contact['name']}{label} ({_format_iban(receiver_iban)})", flush=True)
+
+            # Verification of Payee, as George's form does before creating the order.
+            status, body = _george_api(page, "POST", PAYEE_VERIFICATION_URL, auth, {
+                "verifications": [{"participant": {"name": receiver_name, "bankConnection": {"iban": receiver_iban}}}],
+            })
+            verifications = body.get("verifications") if isinstance(body, dict) else None
+            verification = verifications[0] if isinstance(verifications, list) and verifications else {}
+            payee_result = verification.get("result") if isinstance(verification, dict) else None
+            print(f"{prefix} Payee check: {payee_result or f'not available (HTTP {status})'}", flush=True)
+            if payee_result != "MATCH":
+                if isinstance(verification, dict) and len(verification) > 1:
+                    print(f"{prefix}   {json.dumps(verification, ensure_ascii=False)}", flush=True)
+                if not args.ignore_payee_check:
+                    print(f"{prefix} Stopped before creating anything: check the recipient name and IBAN, "
+                          "or rerun with --ignore-payee-check.", flush=True)
+                    return 1
+
+            # AT receivers: George's /domestic endpoint. Other SEPA countries: /sepa, which also
+            # gets the sender's BIC.
+            is_sepa = not receiver_iban.startswith("AT")
+            category = "SEPA" if is_sepa else "DOMESTIC"
+            sender_ref = {"iban": sender_iban}
+            if is_sepa:
+                sender_bic = _find_bic(raw_accounts, sender_iban)
+                if sender_bic:
+                    sender_ref["bic"] = sender_bic
+                else:
+                    print(f"{prefix} Note: no BIC found for the sender account; sending without it.", flush=True)
+                if args.instant and day:
+                    print(f"{prefix} ERROR: --date isn't supported for instant payments to non-AT IBANs "
+                          "(George sends those right away).", flush=True)
+                    return 1
+
+            # Earliest booking date, asked for the same order type George's form uses. The answer
+            # also shows the date format George wants: a date (bookingDate) for standard transfers,
+            # a date and time (bookingDateTime) for instant payments.
+            status, booking = _george_api(page, "PUT", f"{PAYMENTS_API_URL}/bookingdate", auth, {
+                "priority": "STANDARD",
+                "orderCategory": category,
+                "orderType": order_type,
+                "sender": sender_ref,
+                "receiver": {"iban": receiver_iban},
+                "amount": amount,
+            })
+            booking_date = None
+            if isinstance(booking, dict):
+                booking_date = booking.get("bookingDateTime") if args.instant else None
+                booking_date = booking_date or booking.get("bookingDate")
+            if status != 200 or not isinstance(booking_date, str) or not re.match(r"\d{4}-\d{2}-\d{2}", booking_date):
+                _print_api_error(prefix, "Booking date lookup", status, booking)
+                return 1
+            earliest = datetime.strptime(booking_date[:10], "%Y-%m-%d").date()
+
+            if args.instant:
+                if not booking.get("instantPaymentAllowed"):
+                    print(f"{prefix} ERROR: George doesn't allow an instant payment for this transfer", flush=True)
+                    return 1
+                if day and day > earliest and not booking.get("instantPaymentFutureDateAllowed"):
+                    print(f"{prefix} ERROR: George doesn't allow a future date for an instant payment", flush=True)
+                    return 1
+            day = day or earliest
+            if day < earliest:
+                print(f"{prefix} ERROR: The earliest possible date is {earliest}", flush=True)
+                return 1
+            # George's own value when the date is the earliest one; otherwise the same format.
+            transfer_date = booking_date if day == earliest else _transfer_date_like(booking_date, day)
+
+            order_request = {
+                "receiverName": receiver_name,
+                "receiver": {"iban": receiver_iban},
+                "amount": amount,
+                "transferDate": transfer_date,
+                "sender": sender_ref,
+                "orderCategory": category,
+                "orderType": order_type,
+            }
+            if is_sepa and args.instant:
+                del order_request["transferDate"]  # George's form sends none for instant SEPA payments
+            if text:
+                order_request["additionalInfo"] = {"text4x35": [text[i:i + 35] for i in range(0, len(text), 35)]}
+
+            endpoint = "sepa" if is_sepa else "domestic"
+            status, order = _george_api(page, "POST", f"{PAYMENTS_API_URL}/{endpoint}", auth, order_request)
+            if status not in (200, 201) or not isinstance(order, dict) or not order.get("id"):
+                _print_api_error(prefix, "Creating the transfer", status, order)
+                return 1
+            _print_transfer_summary(prefix, order, sender)
+
+            if not args.sign:
+                print(f"{prefix} NOT signed. Sign it in George, or delete it there if you don't need it.", flush=True)
+                return 0
+
+            sign_id = (order.get("signInfo") or {}).get("signId")
+            if not sign_id:
+                print(f"{prefix} ERROR: George returned no signId; sign the order in George instead.", flush=True)
+                return 1
+            if not args.yes:
+                if input(f"{prefix} Sign this transfer? [y/N] ").strip().lower() != "y":
+                    print(f"{prefix} NOT signed. The order stays open in George; delete it there if you don't need it.",
+                          flush=True)
+                    return 1
+
+            order_url = f"{PAYMENTS_API_URL}/{quote(str(order['id']), safe='')}"
+            sign_url = f"{order_url}/sign/{quote(str(sign_id), safe='')}"
+            _george_api(page, "GET", sign_url, auth)  # George's form loads the sign info first
+            status, sign = _george_api(page, "POST", sign_url, auth, {"authorizationType": "GEORGE_TOKEN"})
+            if status != 200 or not isinstance(sign, dict):
+                _print_api_error(prefix, "Starting the signature", status, sign)
+                return 1
+            print(f"{prefix} Approve the transfer on your phone now (waiting up to {args.timeout}s)...", flush=True)
+
+            poll = sign.get("poll") if isinstance(sign.get("poll"), dict) else {}
+            poll_url = poll.get("url")
+            interval_ms = max(int(poll.get("interval") or 3000), 1000)
+            deadline = time.time() + max(args.timeout, 0)
+            while poll_url and time.time() < deadline:
+                page.wait_for_timeout(interval_ms)
+                _, poll_body = _george_api(page, "GET", poll_url, auth)
+                poll_state = (poll_body.get("state") or poll_body.get("status")) if isinstance(poll_body, dict) else None
+                if poll_state and poll_state not in ("PROCESSING", "PENDING", "OPEN"):
+                    break
+
+            # Report what George now says about the order, whatever the poll returned.
+            status, final = _george_api(page, "GET", order_url, auth)
+            if status != 200 or not isinstance(final, dict):
+                _print_api_error(prefix, "Reading the order after signing", status, final)
+                return 1
+            sign_state = (final.get("signInfo") or {}).get("state")
+            print(f"{prefix} George: state={final.get('state')} sign state={sign_state}", flush=True)
+            if sign_state == "OPEN":
+                print(f"{prefix} NOT signed (no approval in time). The order stays open in George.", flush=True)
+                return 1
+            if sign_state in ("PROCESSING", "PENDING"):
+                print(f"{prefix} Still waiting for the approval; check the order in George.", flush=True)
+                return 1
+            print(f"{prefix} Signed.", flush=True)
+            return 0
+        finally:
+            context.close()
+
+
+
 def _george_transactions_export_fields() -> str:
     # Keep this list stable; it controls what the export endpoint returns.
     # (Taken from DevTools capture.)
@@ -3993,6 +4535,35 @@ def main():
     dc_sign_parser.add_argument("--out", dest="output", default=None, help="Directory to save the signing response JSON")
     dc_sign_parser.add_argument("--timeout", type=int, default=120, help="Seconds to wait for phone approval (default: 120)")
     dc_sign_parser.set_defaults(func=cmd_datacarrier_sign)
+
+    contacts_parser = subparsers.add_parser("contacts", help="List the address book (name, IBAN)")
+    contacts_parser.add_argument("--json", action="store_true", help="Output JSON")
+    contacts_parser.set_defaults(func=cmd_contacts)
+
+    transfer_parser = subparsers.add_parser(
+        "transfer", help="Create a single SEPA transfer to an EU/EEA IBAN (signs only with --sign)")
+    transfer_parser.add_argument("--from", dest="from_account", required=True,
+                                 help="Sender account: id, IBAN or name (see 'accounts')")
+    receiver_group = transfer_parser.add_mutually_exclusive_group(required=True)
+    receiver_group.add_argument("--to-iban", help="Recipient IBAN (EU/EEA country)")
+    receiver_group.add_argument("--to-contact",
+                                help="Recipient from the address book: name, alias or IBAN (see 'contacts')")
+    transfer_parser.add_argument("--to-name",
+                                 help="Recipient name, as on their account (required with --to-iban; "
+                                      "with --to-contact it replaces the contact's name)")
+    transfer_parser.add_argument("--amount", required=True, help="Amount in EUR, e.g. 12.34")
+    transfer_parser.add_argument("--text", default="", help="Payment text, up to 140 characters")
+    transfer_parser.add_argument("--date", default=None, help="Execution date YYYY-MM-DD (default: earliest possible)")
+    transfer_parser.add_argument("--instant", action="store_true", help="Send as an instant payment")
+    transfer_parser.add_argument("--sign", action="store_true",
+                                 help="Sign after creating it (asks y/N, then approve on your phone)")
+    transfer_parser.add_argument("--yes", action="store_true",
+                                 help="With --sign: skip the y/N question (the phone approval is still required)")
+    transfer_parser.add_argument("--ignore-payee-check", action="store_true",
+                                 help="Continue even if the name doesn't match the IBAN's account holder")
+    transfer_parser.add_argument("--timeout", type=int, default=120,
+                                 help="Seconds to wait for the phone approval (default: 120)")
+    transfer_parser.set_defaults(func=cmd_transfer)
 
     args = parser.parse_args()
     _apply_state_dir()
