@@ -2040,12 +2040,22 @@ def upload_datacarrier_file(page, file_path: Path, file_type: Optional[str] = No
                 else:
                     file_input.set_input_files(str(file_path))
                 # George's own "Import" button; the generic list is the fallback for other UIs.
+                # On the auto-upload UI that button stays visible but disabled once the file is
+                # chosen. count() still finds it, and clicking a disabled button times out even
+                # after expect_response has the upload. Skip that click, and don't let a click
+                # failure throw away a response that already arrived.
                 import_button = page.get_by_role("button", name=_DATACARRIER_IMPORT_BUTTON)
-                if import_button.count() > 0:
-                    import_button.first.click()
-                    clicked = True
-                else:
-                    clicked = _click_first_visible_button(page, upload_buttons)
+                clicked = False
+                try:
+                    visible_import = import_button.count() > 0 and import_button.first.is_visible()
+                    if visible_import:
+                        if import_button.first.is_enabled():
+                            import_button.first.click()
+                            clicked = True
+                    else:
+                        clicked = _click_first_visible_button(page, upload_buttons)
+                except Exception:
+                    clicked = False
                 if not clicked:
                     # Some UIs auto-upload after file selection
                     pass
@@ -2063,15 +2073,23 @@ def upload_datacarrier_file(page, file_path: Path, file_type: Optional[str] = No
 
         # response.json() first waits, without a timeout, until the browser reports the request
         # as finished. George's upload request does not always get that report, which hung the
-        # upload forever. Read the body only once it has; otherwise return the HTTP status.
+        # upload forever. Read the body only once it has; otherwise keep just the HTTP status.
         deadline = time.time() + 10
         while response.request not in settled and time.time() < deadline:
             page.wait_for_timeout(200)
-        if response.request not in settled:
-            return {"status": response.status}
+        request_settled = response.request in settled
+        http_status = response.status
     finally:
         page.remove_listener("requestfinished", _on_settled)
         page.remove_listener("requestfailed", _on_settled)
+
+    # A 400/500 JSON body is still a failed upload. Only a 2xx is success, including the
+    # status-only result used when the body never becomes readable.
+    if not 200 <= http_status < 300:
+        print(f"[datacarrier-upload] ERROR: Upload rejected with HTTP {http_status}", flush=True)
+        return None
+    if not request_settled:
+        return {"status": http_status}
 
     try:
         return response.json()
@@ -2963,7 +2981,13 @@ def cmd_datacarrier_upload(args):
                 if len(file_paths) > 1:
                     print(f"[datacarrier-upload] File {index}/{len(file_paths)}: {file_path.name}", flush=True)
 
-                payload = upload_datacarrier_file(page, file_path, args.type)
+                try:
+                    payload = upload_datacarrier_file(page, file_path, args.type)
+                except Exception as e:
+                    # A missing file or other per-file error must not skip the batch summary.
+                    print(f"[datacarrier-upload] ERROR: Upload failed for {file_path.name}: {e}", flush=True)
+                    failed = file_path
+                    break
                 if payload is None:
                     failed = file_path
                     break
@@ -2987,7 +3011,9 @@ def cmd_datacarrier_upload(args):
 
                 if output_dir:
                     ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-                    out_path = output_dir / f"{file_path.name}.datacarrier.{ts}.json"
+                    # Index keeps same-basename files (a/payments.xml, b/payments.xml) from
+                    # overwriting each other when both land in the same UTC second.
+                    out_path = output_dir / f"{file_path.name}.datacarrier.{index}.{ts}.json"
                     with open(out_path, "w") as f:
                         json.dump(payload, f, indent=2, sort_keys=True)
                     print(f"[datacarrier-upload] Saved response: {out_path}", flush=True)
