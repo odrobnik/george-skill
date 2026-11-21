@@ -30,7 +30,7 @@ python3 {baseDir}/scripts/george.py logout
 python3 {baseDir}/scripts/george.py accounts
 python3 {baseDir}/scripts/george.py transactions --account <id|iban> --from YYYY-MM-DD --until YYYY-MM-DD
 python3 {baseDir}/scripts/george.py datacarrier-list [--json] [--state OPEN|CLOSED]
-python3 {baseDir}/scripts/george.py datacarrier-upload <file> [--type pain.001] [--out <dir>] [--wait-done] [--wait-done-timeout 120]
+python3 {baseDir}/scripts/george.py datacarrier-upload <file> [<file> ...] [--type pain.001] [--out <dir>] [--wait-done] [--wait-done-timeout 120]
 python3 {baseDir}/scripts/george.py datacarrier-sign <datacarrier_id> [--sign-id <id>] [--out <dir>]
 ```
 
