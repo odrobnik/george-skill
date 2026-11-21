@@ -2220,9 +2220,11 @@ def _snapshot_datacarrier_file_ids(context) -> tuple[set, Optional[str]]:
 def _recover_datacarrier_file_id(context, file_name: str, known_ids: set) -> Optional[str]:
     """Return the id of the file this upload added.
 
-    The list can lag the upload by a moment. One new id is enough. Several new ids are
-    used only when exactly one of them is named like the file; otherwise the upload we
-    should wait on is ambiguous.
+    The list can lag the upload. A new row counts only when its name is this file.
+    An earlier upload can show up on its own after the next file is already accepted;
+    taking that id would record it, and --wait-done would treat it as done, for the
+    file that is still processing. Differently named rows are remembered so a later
+    file cannot claim them either.
     """
     for attempt in range(4):
         fresh = []
@@ -2231,13 +2233,17 @@ def _recover_datacarrier_file_id(context, file_name: str, known_ids: set) -> Opt
             if item_id is None or str(item_id) in known_ids:
                 continue
             fresh.append(item)
-        if len(fresh) == 1:
-            return str(_datacarrier_item_id(fresh[0]))
-        if len(fresh) > 1:
-            named = [item for item in fresh if _datacarrier_item_name(item) == file_name]
-            if len(named) == 1:
-                return str(_datacarrier_item_id(named[0]))
+        named = [item for item in fresh if _datacarrier_item_name(item) == file_name]
+        if len(named) == 1:
+            return str(_datacarrier_item_id(named[0]))
+        # Two rows already share this name; waiting will not tell them apart.
+        if len(named) > 1:
             return None
+        for item in fresh:
+            if _datacarrier_item_name(item) not in (None, file_name):
+                item_id = _datacarrier_item_id(item)
+                if item_id is not None:
+                    known_ids.add(str(item_id))
         if attempt < 3:
             time.sleep(1)
     return None
