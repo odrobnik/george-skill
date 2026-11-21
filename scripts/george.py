@@ -2083,8 +2083,9 @@ def upload_datacarrier_file(page, file_path: Path, file_type: Optional[str] = No
         page.remove_listener("requestfinished", _on_settled)
         page.remove_listener("requestfailed", _on_settled)
 
-    # A 400/500 JSON body is still a failed upload. Only a 2xx is success, including the
-    # status-only result used when the body never becomes readable.
+    # A 400/500 JSON body is still a failed upload. Only a 2xx is success. When the body
+    # never becomes readable there is no file id here; the command resolves it from the
+    # file list before honoring --wait-done.
     if not 200 <= http_status < 300:
         print(f"[datacarrier-upload] ERROR: Upload rejected with HTTP {http_status}", flush=True)
         return None
@@ -2132,31 +2133,104 @@ def _build_datacarrier_files_list_url() -> str:
     return f"{DATACARRIER_FILES_API_URL}?page=0&size=100"
 
 
-def _extract_datacarrier_file_state(payload, file_id: Optional[Union[str, int]]) -> tuple[Optional[str], Optional[dict]]:
-    if file_id is None:
-        return None, None
-
+def _datacarrier_file_items(payload) -> list:
     items = []
     if isinstance(payload, list):
         items = payload
     elif isinstance(payload, dict):
         for key in ("items", "data", "datacarrierFiles", "files", "content"):
-            v = payload.get(key)
-            if isinstance(v, list):
-                items = v
+            value = payload.get(key)
+            if isinstance(value, list):
+                items = value
                 break
         else:
             items = [payload]
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _datacarrier_item_id(item: dict):
+    return item.get("id") or item.get("fileId") or item.get("uuid")
+
+
+def _datacarrier_item_name(item: dict) -> Optional[str]:
+    name = item.get("name") or item.get("fileName") or item.get("filename")
+    return name if isinstance(name, str) else None
+
+
+def _extract_datacarrier_file_state(payload, file_id: Optional[Union[str, int]]) -> tuple[Optional[str], Optional[dict]]:
+    if file_id is None:
+        return None, None
 
     file_id_s = str(file_id)
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        item_id = item.get("id") or item.get("fileId") or item.get("uuid")
+    for item in _datacarrier_file_items(payload):
+        item_id = _datacarrier_item_id(item)
         if item_id is not None and str(item_id) == file_id_s:
             state = item.get("state") or item.get("status")
             return state, item
     return None, None
+
+
+def _fetch_datacarrier_files(context) -> list:
+    resp = context.request.get(_build_datacarrier_files_list_url(), timeout=30000)
+    status = resp.status
+    if not 200 <= status < 300:
+        raise RuntimeError(f"file list returned HTTP {status}")
+    return _datacarrier_file_items(resp.json())
+
+
+def _snapshot_datacarrier_file_ids(context) -> tuple[set, Optional[str]]:
+    """Ids already on the file list, so a later upload can be told apart from them.
+
+    The second value is an error string when the list could not be read.
+    """
+    try:
+        items = _fetch_datacarrier_files(context)
+    except Exception as e:
+        return set(), str(e)
+    ids = set()
+    for item in items:
+        item_id = _datacarrier_item_id(item)
+        if item_id is not None:
+            ids.add(str(item_id))
+    return ids, None
+
+
+def _recover_datacarrier_file_id(context, file_name: str, known_ids: set) -> Optional[str]:
+    """Return the id of the file this upload added.
+
+    The list can lag the upload by a moment. One new id is enough. Several new ids are
+    used only when exactly one of them is named like the file; otherwise the upload we
+    should wait on is ambiguous.
+    """
+    for attempt in range(4):
+        fresh = []
+        for item in _fetch_datacarrier_files(context):
+            item_id = _datacarrier_item_id(item)
+            if item_id is None or str(item_id) in known_ids:
+                continue
+            fresh.append(item)
+        if len(fresh) == 1:
+            return str(_datacarrier_item_id(fresh[0]))
+        if len(fresh) > 1:
+            named = [item for item in fresh if _datacarrier_item_name(item) == file_name]
+            if len(named) == 1:
+                return str(_datacarrier_item_id(named[0]))
+            return None
+        if attempt < 3:
+            time.sleep(1)
+    return None
+
+
+def _payload_file_id(payload):
+    if not isinstance(payload, dict):
+        return None
+    return (
+        payload.get("id")
+        or payload.get("fileId")
+        or payload.get("uuid")
+        or payload.get("reference")
+        or payload.get("datacarrierFileId")
+    )
 
 
 def _click_confirmation_button(page) -> bool:
@@ -2977,6 +3051,10 @@ def cmd_datacarrier_upload(args):
                 return 1
 
             dismiss_modals(page)
+            # Snapshot before any upload so a missing response body can still be tied to the
+            # file id that appears on the list afterwards.
+            known_ids, list_error = _snapshot_datacarrier_file_ids(context)
+            known_ids_ok = list_error is None
             for index, file_path in enumerate(file_paths, start=1):
                 if len(file_paths) > 1:
                     print(f"[datacarrier-upload] File {index}/{len(file_paths)}: {file_path.name}", flush=True)
@@ -2992,16 +3070,38 @@ def cmd_datacarrier_upload(args):
                     failed = file_path
                     break
 
-                resp_id = None
+                resp_id = _payload_file_id(payload)
+                if resp_id is None and known_ids_ok:
+                    try:
+                        recovered = _recover_datacarrier_file_id(context, file_path.name, known_ids)
+                    except Exception as e:
+                        recovered = None
+                        if args.wait_done:
+                            print(f"[datacarrier-upload] ERROR: Could not look up file id: {e}", flush=True)
+                    if recovered is not None:
+                        if isinstance(payload, dict):
+                            payload = dict(payload)
+                            payload["id"] = recovered
+                        resp_id = recovered
+                        print(f"[datacarrier-upload] Resolved file id={resp_id} from the file list", flush=True)
+                if resp_id is not None:
+                    known_ids.add(str(resp_id))
+
+                # --wait-done with no id would exit successfully before import processing
+                # finishes. That is a failed upload for this command, not a warning.
+                if args.wait_done and resp_id is None:
+                    if list_error:
+                        print(f"[datacarrier-upload] ERROR: Could not read existing file ids: {list_error}", flush=True)
+                    print(
+                        f"[datacarrier-upload] ERROR: {file_path.name} was accepted, "
+                        "but --wait-done cannot run without a file id",
+                        flush=True,
+                    )
+                    failed = file_path
+                    break
+
                 resp_status = None
                 if isinstance(payload, dict):
-                    resp_id = (
-                        payload.get("id")
-                        or payload.get("fileId")
-                        or payload.get("uuid")
-                        or payload.get("reference")
-                        or payload.get("datacarrierFileId")
-                    )
                     resp_status = payload.get("status") or payload.get("state") or payload.get("result")
 
                 id_part = f" id={resp_id}" if resp_id is not None else ""
@@ -3019,10 +3119,7 @@ def cmd_datacarrier_upload(args):
                     print(f"[datacarrier-upload] Saved response: {out_path}", flush=True)
 
                 if args.wait_done:
-                    if resp_id is None:
-                        print("[datacarrier-upload] --wait-done requested but upload response has no file id", flush=True)
-                    else:
-                        _wait_for_datacarrier_done(context, resp_id, getattr(args, "wait_done_timeout", 120))
+                    _wait_for_datacarrier_done(context, resp_id, getattr(args, "wait_done_timeout", 120))
         finally:
             context.close()
 
