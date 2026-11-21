@@ -3396,15 +3396,23 @@ def _transfer_date_like(template: str, day: date) -> str:
     return day.isoformat()
 
 
-# Exit codes of `transfer`. Anything other than 1 means an order exists in George: never rerun
+# Exit codes of `transfer`. Anything other than 1 means an order may exist in George: never rerun
 # the command on it, or a second order (and a second payment) can be created.
 TRANSFER_EXIT_OK = 0             # signed, or created unsigned without --sign
 TRANSFER_EXIT_ERROR = 1          # failed before any order was created
 TRANSFER_EXIT_NOT_SIGNED = 3     # order created, definitely not signed (still open, or the signature was refused)
-TRANSFER_EXIT_SIGN_UNKNOWN = 4   # order created, signature requested, outcome not known yet
+TRANSFER_EXIT_SIGN_UNKNOWN = 4   # order may exist, creation or signing outcome not known yet
 
 SIGN_DONE_STATES = {"DONE", "COMPLETED", "SIGNED"}
 SIGN_WAITING_STATES = {"OPEN", "PROCESSING", "PENDING"}
+SIGN_FAILED_STATES = {"REJECTED", "CANCELLED", "EXPIRED", "FAILED"}
+
+
+def _transfer_sign_state(payload) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return None
+    state = _extract_sign_state(payload)[1] or payload.get("state") or payload.get("status")
+    return state.upper() if isinstance(state, str) else None
 
 
 def _transfer_result(prefix: str, code: int, order_id, message: str, result: str = "") -> int:
@@ -3414,6 +3422,21 @@ def _transfer_result(prefix: str, code: int, order_id, message: str, result: str
     print(f"{prefix} {message}", flush=True)
     print(f"{prefix} RESULT: {result} order_id={order_id} exit={code}", flush=True)
     return code
+
+
+def _transfer_sign_result(prefix: str, order_id, sign_state, poll_state) -> int:
+    states = {sign_state, poll_state}
+    done = bool(states & SIGN_DONE_STATES)
+    refused = bool(states & SIGN_FAILED_STATES)
+    if done and not refused:
+        return _transfer_result(prefix, TRANSFER_EXIT_OK, order_id, "Signed.")
+    if refused and not done:
+        return _transfer_result(prefix, TRANSFER_EXIT_NOT_SIGNED, order_id,
+                                "NOT signed (signature refused or failed). The order may stay open in George; "
+                                "sign or delete it there. Do not rerun this command.")
+    return _transfer_result(prefix, TRANSFER_EXIT_SIGN_UNKNOWN, order_id,
+                            "Not confirmed as signed. The phone approval may still go through; "
+                            "check the order in George. Do not rerun this command.")
 
 
 def _print_transfer_summary(prefix: str, order: dict, sender: dict) -> None:
@@ -3483,8 +3506,8 @@ def cmd_transfer(args):
     1. Check the inputs offline (IBAN checksum and country, amount, text, date)
     2. Login, capture the API token, find the sender account (and the address book contact)
     3. Payee verification: does the name match the IBAN's account holder?
-    4. Ask George for the earliest booking date, create the order (state OPEN)
-    5. With --sign: confirm, POST the sign request, wait for the phone approval
+    4. Ask George for the earliest booking date, confirm with --sign, create the order (state OPEN)
+    5. With --sign: POST the sign request, wait for the phone approval
     """
     prefix = "[transfer]"
     try:
@@ -3522,6 +3545,11 @@ def cmd_transfer(args):
 
     order_type = "INSTANT_PAYMENT_OUT" if args.instant else "PAYMENT_OUT"
     amount = {"value": cents, "precision": 2, "currency": "EUR"}
+    creation_attempted = False
+    order_id = None
+    signature_requested = False
+    poll_state = None
+    sign_state = None
 
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
@@ -3661,10 +3689,16 @@ def cmd_transfer(args):
                     return TRANSFER_EXIT_ERROR
 
             endpoint = "sepa" if is_sepa else "domestic"
+            creation_attempted = True
             status, order = _george_api(page, "POST", f"{PAYMENTS_API_URL}/{endpoint}", auth, order_request)
             if status not in (200, 201) or not isinstance(order, dict) or not order.get("id"):
                 _print_api_error(prefix, "Creating the transfer", status, order)
-                return 1
+                if 400 <= status < 500 and status != 408:
+                    return TRANSFER_EXIT_ERROR
+                return _transfer_result(prefix, TRANSFER_EXIT_SIGN_UNKNOWN, "unknown",
+                                        "Creation could not be confirmed; an order may exist in George. "
+                                        "Check George before doing anything else. Do not rerun this command.")
+            order_id = order["id"]
             _print_transfer_summary(prefix, order, sender)
 
             if not args.sign:
@@ -3672,21 +3706,23 @@ def cmd_transfer(args):
                                         "NOT signed (no --sign). Sign it in George, or delete it there if you don't need it.",
                                         result="created")
 
-            order_id = order["id"]
-            sign_id = (order.get("signInfo") or {}).get("signId")
+            sign_info = order.get("signInfo")
+            sign_id = sign_info.get("signId") if isinstance(sign_info, dict) else None
             if not sign_id:
                 return _transfer_result(prefix, TRANSFER_EXIT_NOT_SIGNED, order_id,
-                                        "George returned no signId. NOT signed; sign or delete the order in George.")
+                                        "George returned no signId. NOT signed; sign or delete the order in George. "
+                                        "Do not rerun this command.")
 
             order_url = f"{PAYMENTS_API_URL}/{quote(str(order_id), safe='')}"
             sign_url = f"{order_url}/sign/{quote(str(sign_id), safe='')}"
             _george_api(page, "GET", sign_url, auth)  # George's form loads the sign info first
+            signature_requested = True
             status, sign = _george_api(page, "POST", sign_url, auth, {"authorizationType": "GEORGE_TOKEN"})
             if status != 200 or not isinstance(sign, dict):
                 _print_api_error(prefix, "Starting the signature", status, sign)
-                if 400 <= status < 500:
+                if 400 <= status < 500 and status != 408:
                     return _transfer_result(prefix, TRANSFER_EXIT_NOT_SIGNED, order_id,
-                                            "NOT signed. Sign or delete the order in George.")
+                                            "NOT signed. Sign or delete the order in George. Do not rerun this command.")
                 return _transfer_result(prefix, TRANSFER_EXIT_SIGN_UNKNOWN, order_id,
                                         "The signature may have been requested; check your phone and the order "
                                         "in George. Do not rerun this command.")
@@ -3694,25 +3730,23 @@ def cmd_transfer(args):
 
             poll = sign.get("poll") if isinstance(sign.get("poll"), dict) else {}
             poll_url = poll.get("url")
+            poll_state = _transfer_sign_state(sign)
             interval_ms = max(int(poll.get("interval") or 3000), 1000)
             deadline = time.time() + args.timeout
-            poll_state = None
-            while poll_url and time.time() < deadline:
+            while poll_url and poll_state not in SIGN_DONE_STATES | SIGN_FAILED_STATES and time.time() < deadline:
                 page.wait_for_timeout(interval_ms)
-                _, poll_body = _george_api(page, "GET", poll_url, auth)
-                state = (poll_body.get("state") or poll_body.get("status")) if isinstance(poll_body, dict) else None
+                status, poll_body = _george_api(page, "GET", poll_url, auth)
+                state = _transfer_sign_state(poll_body) if status == 200 else None
                 if state:
-                    poll_state = str(state).upper()
-                    if poll_state not in SIGN_WAITING_STATES:
-                        break
+                    poll_state = state
 
             # Check what George now says about the order. A finished poll can be ahead of the order,
             # so give the order a few seconds to catch up before deciding.
-            sign_state = None
             for attempt in range(4):
                 status, final = _george_api(page, "GET", order_url, auth)
                 if status == 200 and isinstance(final, dict):
-                    sign_state = str((final.get("signInfo") or {}).get("state") or "").upper() or None
+                    state = _extract_sign_state(final)[1]
+                    sign_state = state.upper() if isinstance(state, str) else None
                     print(f"{prefix} George: state={final.get('state')} sign state={sign_state} "
                           f"(poll: {poll_state or '-'})", flush=True)
                     if not (poll_state in SIGN_DONE_STATES and sign_state in SIGN_WAITING_STATES):
@@ -3722,24 +3756,27 @@ def cmd_transfer(args):
                 if attempt < 3:
                     page.wait_for_timeout(2000)
 
-            # Only an explicit success state counts as signed.
-            waiting = (None, *SIGN_WAITING_STATES)
-            if sign_state in SIGN_DONE_STATES:
-                return _transfer_result(prefix, TRANSFER_EXIT_OK, order_id, "Signed.")
-            if poll_state in SIGN_DONE_STATES and sign_state in waiting:
-                return _transfer_result(prefix, TRANSFER_EXIT_OK, order_id,
-                                        "Signed (the approval went through; George hasn't updated the order yet).")
-            refused = sign_state if sign_state not in waiting else (
-                poll_state if poll_state not in waiting and poll_state not in SIGN_DONE_STATES else None)
-            if refused and poll_state not in SIGN_DONE_STATES:
+            return _transfer_sign_result(prefix, order_id, sign_state, poll_state)
+        except (Exception, KeyboardInterrupt):
+            # Never turn a side effect into a retryable exit 1, including browser errors or Ctrl-C.
+            if signature_requested:
+                return _transfer_sign_result(prefix, order_id, sign_state, poll_state)
+            if order_id is not None:
                 return _transfer_result(prefix, TRANSFER_EXIT_NOT_SIGNED, order_id,
-                                        f"NOT signed (state {refused}). The order may stay open in George; "
-                                        "sign or delete it there.")
-            return _transfer_result(prefix, TRANSFER_EXIT_SIGN_UNKNOWN, order_id,
-                                    "Not confirmed as signed. The phone approval may still go through; "
-                                    "check the order in George. Do not rerun this command.")
+                                        "Order created; signing was not requested. Check or delete it in George. "
+                                        "Do not rerun this command.")
+            if creation_attempted:
+                return _transfer_result(prefix, TRANSFER_EXIT_SIGN_UNKNOWN, "unknown",
+                                        "Creation was interrupted; an order may exist in George. "
+                                        "Check George. Do not rerun this command.")
+            print(f"{prefix} Stopped before creating anything.", flush=True)
+            return TRANSFER_EXIT_ERROR
         finally:
-            context.close()
+            try:
+                context.close()
+            except Exception:
+                # Browser cleanup must not replace the transfer's result with exit 1.
+                pass
 
 
 
