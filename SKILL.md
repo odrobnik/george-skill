@@ -32,6 +32,8 @@ python3 {baseDir}/scripts/george.py transactions --account <id|iban> --from YYYY
 python3 {baseDir}/scripts/george.py datacarrier-list [--json] [--state OPEN|CLOSED]
 python3 {baseDir}/scripts/george.py datacarrier-upload <file> [<file> ...] [--type pain.001] [--out <dir>] [--wait-done] [--wait-done-timeout 120]
 python3 {baseDir}/scripts/george.py datacarrier-sign <datacarrier_id> [--sign-id <id>] [--out <dir>]
+python3 {baseDir}/scripts/george.py contacts [--json]
+python3 {baseDir}/scripts/george.py transfer --from <account> (--to-iban <IBAN> --to-name "<name>" | --to-contact "<contact>") --amount 12.34 [--text "<text>"] [--date YYYY-MM-DD] [--instant] [--sign] [--yes]
 ```
 
 ## Recommended Flow
@@ -39,10 +41,13 @@ python3 {baseDir}/scripts/george.py datacarrier-sign <datacarrier_id> [--sign-id
 ```
 login → accounts → transactions → portfolio → logout
 login → datacarrier-upload → datacarrier-sign → logout
+login → transfer → logout
 ```
 
 Always call `logout` after completing all operations to clear the stored browser session (cookies, local storage, Playwright profile). This minimizes persistent auth state on disk.
 
 ## Notes
+- `transfer` creates the order unsigned unless `--sign` is given. With `--sign` it asks y/N before creating anything (skip with `--yes`), and the transfer still needs approval on the phone. Exit codes: `0` signed (or created unsigned without `--sign`), `1` failed before any order was created, `3` order created but not signed, `4` creation or signing outcome is unknown (an order may exist, and the phone approval may still go through). After creation is attempted, exits 0, 3 and 4 end with `RESULT: <signed|created|not_signed|unknown> order_id=<id> exit=<code>`; `order_id=unknown` means creation could not be confirmed. Only explicit `DONE`, `COMPLETED` or `SIGNED` states confirm signing; missing, unfamiliar or conflicting states remain unknown. **Never rerun `transfer` after exit 3 or 4**: that can create a second order; check or delete the existing one in George instead. `--sign` requires `--timeout` above zero. `--to-contact` takes the recipient's IBAN and name from the George address book (`contacts` lists it). Receiver IBANs from EU/EEA countries are supported.
 - Session state stored in `{workspace}/george/` with restrictive permissions (dirs `700`, files `600`).
+- The `transfer` and `contacts` API requests, including response-body reads, have a 30-second limit. Signing, polling and final status reads also share the remaining `--timeout` budget. A timeout does not cancel an order or a pending phone approval.
 - Ephemeral exports default to `/tmp/openclaw/george` (override with `OPENCLAW_TMP`).
