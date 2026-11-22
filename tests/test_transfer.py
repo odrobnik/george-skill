@@ -8,8 +8,11 @@ from contextlib import ExitStack, redirect_stdout
 from copy import deepcopy
 import importlib.util
 import io
+import json
 import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import unittest
 from unittest.mock import MagicMock, patch
@@ -57,14 +60,14 @@ class TransferTests(unittest.TestCase):
         ):
             self.stack.enter_context(patch.object(george, name, return_value=value))
         self.stack.enter_context(patch.object(george, "USER_ID_OVERRIDE", None))
-        self.stack.enter_context(patch.object(george.time, "time", side_effect=lambda: self.clock))
+        self.stack.enter_context(patch.object(george.time, "monotonic", side_effect=lambda: self.clock))
         self.stack.enter_context(patch.object(george.sys.stdin, "isatty", return_value=True))
         self.api = self.stack.enter_context(patch.object(george, "_george_api", side_effect=self.request))
 
     def wait(self, milliseconds):
         self.clock += milliseconds / 1000
 
-    def request(self, page, method, url, auth, body=None):
+    def request(self, page, method, url, auth, body=None, *, timeout_ms=None):
         self.calls.append((method, url, deepcopy(body)))
         self.assertIs(page, self.page)
         self.assertEqual(auth, "test-token")
@@ -106,18 +109,21 @@ class TransferTests(unittest.TestCase):
                              for method, url, _ in self.calls))
 
     def test_only_explicit_final_success_is_signed(self):
+        self.sign = (200, {})
         for state in ("DONE", "COMPLETED", "SIGNED", "signed"):
             with self.subTest(state=state):
                 self.final = (200, {"signInfo": {"state": state}})
                 self.run_transfer(0, "signed")
 
     def test_final_refusals_are_not_signed(self):
+        self.sign = (200, {})
         for state in ("REJECTED", "CANCELLED", "EXPIRED", "FAILED"):
             with self.subTest(state=state):
                 self.final = (200, {"signInfo": {"state": state}})
                 self.run_transfer(3, "not_signed")
 
     def test_missing_waiting_and_unfamiliar_states_are_unknown(self):
+        self.sign = (200, {})
         for info in (None, {}, "bad-layout", {"state": None}, {"state": "OPEN"},
                      {"state": "PENDING"}, {"state": "PROCESSING"}, {"state": "NEW_STATE"},
                      {"state": ["SIGNED"]}):
@@ -149,28 +155,30 @@ class TransferTests(unittest.TestCase):
         self.run_transfer(0, "signed")
 
     def test_poll_continues_after_waiting_or_unfamiliar_state(self):
+        self.args.timeout = 3
         for state in ("PENDING", "NEW_STATE"):
             with self.subTest(state=state):
                 responses = iter(((200, {"state": state}), (200, {"state": "DONE"})))
 
-                def request(page, method, url, auth, body=None):
+                def request(page, method, url, auth, body=None, **kwargs):
                     if url == "https://poll.example/sign":
                         self.polled = next(responses)
-                    return self.request(page, method, url, auth, body)
+                    return self.request(page, method, url, auth, body, **kwargs)
 
                 self.api.side_effect = request
                 self.run_transfer(0, "signed")
                 self.assertEqual(sum(url == "https://poll.example/sign" for _, url, _ in self.calls), 2)
 
     def test_order_can_catch_up_after_successful_poll(self):
+        self.args.timeout = 5
         self.polled = (200, {"state": "DONE"})
         responses = iter(((200, {"signInfo": {"state": "OPEN"}}),
                           (200, {"signInfo": {"state": "SIGNED"}})))
 
-        def request(page, method, url, auth, body=None):
+        def request(page, method, url, auth, body=None, **kwargs):
             if url.endswith("/order-123"):
                 self.final = next(responses)
-            return self.request(page, method, url, auth, body)
+            return self.request(page, method, url, auth, body, **kwargs)
 
         self.api.side_effect = request
         self.run_transfer(0, "signed")
@@ -195,6 +203,7 @@ class TransferTests(unittest.TestCase):
 
     def test_confirmation_precedes_creation(self):
         self.args.yes = False
+        self.sign = (200, {})
 
         def confirm(prompt):
             self.assert_no_order()
@@ -217,6 +226,15 @@ class TransferTests(unittest.TestCase):
         with patch.object(george.sys.stdin, "isatty", return_value=False):
             self.run_transfer(1)
         self.api.assert_not_called()
+
+    def test_empty_contact_selector_fails_before_login(self):
+        self.args.to_iban = None
+        for selector in ("", "   ", "\t\n", "\u2003"):
+            with self.subTest(selector=selector):
+                self.args.to_contact = selector
+                self.run_transfer(1)
+                george.login.assert_not_called()
+                self.api.assert_not_called()
 
     def test_unsigned_creation_does_not_start_signature(self):
         self.args.sign = False
@@ -242,6 +260,7 @@ class TransferTests(unittest.TestCase):
         self.run_transfer(3, "not_signed")
 
     def test_read_and_wait_failures_after_sign_are_unknown(self):
+        self.sign = (200, {})
         for response in ((503, {}), RuntimeError("browser lost"), KeyboardInterrupt()):
             with self.subTest(response=response):
                 self.final = response
@@ -252,6 +271,51 @@ class TransferTests(unittest.TestCase):
     def test_malformed_poll_interval_is_unknown(self):
         self.sign = (200, {"poll": {"url": "https://poll.example/sign", "interval": "invalid"}})
         self.run_transfer(4, "unknown")
+
+    def test_poll_stall_uses_remaining_budget_and_returns_unknown(self):
+        def request(page, method, url, auth, body=None, **kwargs):
+            if url == "https://poll.example/sign":
+                self.assertEqual(kwargs["timeout_ms"], 1000)
+                self.clock += kwargs["timeout_ms"] / 1000
+                self.polled = (0, "The operation was aborted")
+            return self.request(page, method, url, auth, body, **kwargs)
+
+        self.api.side_effect = request
+        self.run_transfer(4, "unknown")
+        self.assertEqual(self.clock, self.args.timeout)
+        self.assertFalse(any(url.endswith("/order-123") for _, url, _ in self.calls))
+
+    def test_poll_interval_cannot_exceed_approval_budget(self):
+        self.sign[1]["poll"]["interval"] = 60000
+        self.run_transfer(4, "unknown")
+        self.assertEqual(self.clock, self.args.timeout)
+        self.assertFalse(any(url == "https://poll.example/sign" for _, url, _ in self.calls))
+
+    def test_sign_post_stall_uses_approval_budget_and_returns_unknown(self):
+        def request(page, method, url, auth, body=None, **kwargs):
+            if method == "POST" and "/sign/" in url:
+                self.assertEqual(kwargs["timeout_ms"], 2000)
+                self.clock += kwargs["timeout_ms"] / 1000
+                self.sign = (0, "The operation was aborted")
+            return self.request(page, method, url, auth, body, **kwargs)
+
+        self.api.side_effect = request
+        self.run_transfer(4, "unknown")
+        self.assertEqual(self.clock, self.args.timeout)
+
+    def test_final_read_stall_cannot_extend_approval_budget(self):
+        self.polled = (200, {"state": "SIGNED"})
+
+        def request(page, method, url, auth, body=None, **kwargs):
+            if url.endswith("/order-123"):
+                self.assertEqual(kwargs["timeout_ms"], 1000)
+                self.clock += kwargs["timeout_ms"] / 1000
+                self.final = (0, "The operation was aborted")
+            return self.request(page, method, url, auth, body, **kwargs)
+
+        self.api.side_effect = request
+        self.run_transfer(0, "signed")
+        self.assertEqual(self.clock, self.args.timeout)
 
     def test_error_before_signature_preserves_created_order(self):
         with patch.object(george, "_print_transfer_summary", side_effect=ValueError("bad-layout")):
@@ -270,9 +334,123 @@ class TransferTests(unittest.TestCase):
 
     def test_cleanup_failure_preserves_result(self):
         self.context.close.side_effect = RuntimeError("browser lost")
+        self.sign = (200, {})
         self.run_transfer(4, "unknown")
         self.final = (200, {"signInfo": {"state": "SIGNED"}})
         self.run_transfer(0, "signed")
+
+
+class ContactTests(unittest.TestCase):
+    def setUp(self):
+        self.entries = [{"name": "Jane Doe", "label": "", "iban": "DE89370400440532013000"}]
+
+    def test_empty_selector_cannot_match_optional_empty_label(self):
+        for selector in (None, "", "   ", "\t\n", "\u2003"):
+            with self.subTest(selector=selector):
+                with self.assertRaisesRegex(ValueError, "Contact selector must contain"):
+                    george._find_contact(self.entries, selector)
+
+    def test_nonempty_name_alias_and_iban_still_match(self):
+        self.entries[0]["label"] = "Friend"
+        for selector in ("  Jane Doe  ", "jane", "FRIEND", "DE89 3704 0044 0532 0130 00"):
+            with self.subTest(selector=selector):
+                self.assertEqual(george._find_contact(self.entries, selector), self.entries[0])
+
+
+class AddressbookPaginationTests(unittest.TestCase):
+    def setUp(self):
+        self.first = {"name": "Jane Doe", "iban": "DE89370400440532013000"}
+        self.last = {"name": "Jane Smith", "iban": "AT611904300234573201"}
+
+    def fetch(self, responses):
+        output = io.StringIO()
+        with patch.object(george, "_george_api", side_effect=responses) as api, redirect_stdout(output):
+            entries = george._fetch_addressbook(MagicMock(), "test-token", "[contacts]")
+        return entries, api.call_count, output.getvalue()
+
+    def test_nonfinal_pages_without_new_ibans_do_not_truncate_book(self):
+        for count_key in ("totalPages", "pageCount"):
+            for middle in ([{"name": "No bank details"}], [self.first], []):
+                with self.subTest(count_key=count_key, middle=middle):
+                    responses = [(200, {"contacts": contacts, count_key: 3})
+                                 for contacts in ([self.first], middle, [self.last])]
+                    entries, calls, _ = self.fetch(responses)
+                    self.assertEqual([e["name"] for e in entries], ["Jane Doe", "Jane Smith"])
+                    self.assertEqual(calls, 3)
+                    with self.assertRaisesRegex(ValueError, "matches several contacts"):
+                        george._find_contact(entries, "Jane")
+
+    def test_without_metadata_stop_on_raw_empty_page_not_filtered_empty_page(self):
+        for middle in ([{"name": "No bank details"}],
+                       [{**self.first, "alias": "Duplicate account"}]):
+            with self.subTest(middle=middle):
+                entries, calls, _ = self.fetch([(200, contacts) for contacts in
+                                               ([self.first], middle, [self.last], [])])
+                self.assertEqual([e["name"] for e in entries], ["Jane Doe", "Jane Smith"])
+                self.assertEqual(calls, 4)
+
+    def test_page_count_persists_when_later_page_omits_it(self):
+        entries, calls, _ = self.fetch([
+            (200, {"contacts": [self.first], "totalPages": 3}),
+            (200, {"contacts": []}), (200, {"contacts": [self.last]})])
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(calls, 3)
+
+    def test_repeated_raw_pages_without_metadata_fail_closed(self):
+        entries, calls, output = self.fetch([
+            (200, {"contacts": [self.first], "page": 0}),
+            (200, {"contacts": [self.first], "page": 1})])
+        self.assertIsNone(entries)
+        self.assertEqual(calls, 2)
+        self.assertIn("completeness is unknown", output)
+
+    def test_plain_url_fallback_respects_page_count(self):
+        entries, calls, _ = self.fetch([
+            (400, {}), (200, {"contacts": [self.first], "totalPages": 2}),
+            (200, {"contacts": [self.last], "totalPages": 2})])
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(calls, 3)
+
+    def test_page_limit_does_not_return_partial_book(self):
+        entries, calls, output = self.fetch([
+            (200, {"contacts": [self.first], "totalPages": 101})] * 100)
+        self.assertIsNone(entries)
+        self.assertEqual(calls, 100)
+        self.assertIn("completeness is unknown", output)
+
+
+class GeorgeAPITimeoutTests(unittest.TestCase):
+    def test_expired_budget_never_sends_request(self):
+        for timeout_ms in (0, -1):
+            with self.subTest(timeout_ms=timeout_ms):
+                page = MagicMock()
+                status, _ = george._george_api(page, "POST", "unused", "token", timeout_ms=timeout_ms)
+                self.assertEqual(status, 0)
+                page.evaluate.assert_not_called()
+
+    def test_default_and_custom_request_timeouts_are_finite(self):
+        for timeout_ms, expected in ((None, 30000), (100, 100), (60000, 30000)):
+            with self.subTest(timeout_ms=timeout_ms):
+                page = MagicMock()
+                page.evaluate.return_value = {"status": 200, "body": {}}
+                kwargs = {} if timeout_ms is None else {"timeout_ms": timeout_ms}
+                george._george_api(page, "GET", "unused", "token", **kwargs)
+                self.assertEqual(page.evaluate.call_args.args[1][-1], expected)
+
+    @unittest.skipUnless(shutil.which("node"), "Node is needed to execute the request JavaScript")
+    def test_javascript_cancels_stalled_fetch_and_body_and_cleans_up_timers(self):
+        for scenario in ("success", "fetch_stall", "body_stall", "error"):
+            with self.subTest(scenario=scenario):
+                page = MagicMock()
+                page.evaluate.return_value = {"status": 200, "body": {}}
+                george._george_api(page, "POST", "https://bank.invalid/test", "test-token",
+                                   {"amount": 1234}, timeout_ms=25)
+                source, args = page.evaluate.call_args.args
+                completed = subprocess.run(
+                    [shutil.which("node"), str(Path(__file__).with_name("check_api_timeout.js"))],
+                    input=json.dumps({"source": source, "args": args, "scenario": scenario}),
+                    text=True, capture_output=True, timeout=5)
+                self.assertEqual(completed.returncode, 0, completed.stderr)
 
 
 if __name__ == "__main__":

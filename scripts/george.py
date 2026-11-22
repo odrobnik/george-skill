@@ -3152,6 +3152,7 @@ PAYEE_VERIFICATION_URL = (
     "https://api.sparkasse.at/proxy/ggw/payment/public/payment-initiations/validation/payee-verification"
 )
 ADDRESSBOOK_URL = "https://api.sparkasse.at/proxy/g/api/my/addressbook/contacts"
+GEORGE_API_TIMEOUT_MS = 30000
 
 # EU/EEA countries: SEPA transfers there need only IBAN and name (no BIC, no address).
 # Other SEPA countries (CH, GB, ...) need more fields, which this command doesn't send.
@@ -3303,12 +3304,25 @@ def _page_count(body) -> Optional[int]:
     return None
 
 
+def _addressbook_page_content(body):
+    """Raw contacts, before IBAN filtering; ignore paging metadata when comparing pages."""
+    if isinstance(body, dict):
+        for key in ("contacts", "content", "items", "entries", "results", "data"):
+            value = body.get(key)
+            if isinstance(value, (dict, list)):
+                return _addressbook_page_content(value)
+    return body
+
+
 def _fetch_addressbook(page, auth_header: str, prefix: str) -> Optional[list[dict]]:
     """Read all pages of the address book (George returns 20 contacts per page by default)."""
     entries: list[dict] = []
     seen: set = set()
+    seen_pages: set = set()
+    total_pages = None
     first_body = None
     for page_no in range(100):
+        unpaged = False
         status, body = _george_api(page, "GET", f"{ADDRESSBOOK_URL}?page={page_no}&size=100", auth_header)
         if status != 200 and page_no == 0:
             # Maybe George doesn't take paging parameters here: try the plain URL once.
@@ -3316,22 +3330,34 @@ def _fetch_addressbook(page, auth_header: str, prefix: str) -> Optional[list[dic
             if status != 200:
                 _print_api_error(prefix, "Reading the address book", status, body)
                 return None
-            entries = _addressbook_entries(body)
-            first_body = body
-            break
+            unpaged = True
         if status != 200:
             _print_api_error(prefix, f"Reading address book page {page_no + 1}", status, body)
             return None
         if first_body is None:
             first_body = body
+        count = _page_count(body)
+        if count is not None:
+            total_pages = count
+        raw = _addressbook_page_content(body)
+        fingerprint = json.dumps(raw, sort_keys=True)
+        if total_pages is None and raw and fingerprint in seen_pages:
+            # Without a page count, an ignored page parameter cannot be distinguished from
+            # duplicate contacts. Do not use a potentially partial book for recipient matching.
+            print(f"{prefix} ERROR: Address book repeated a raw page; completeness is unknown.", flush=True)
+            return None
+        seen_pages.add(fingerprint)
         new = [e for e in _addressbook_entries(body) if (e["name"], e["iban"]) not in seen]
-        if not new:
-            break  # an empty page, or George ignored the page number and sent page 1 again
         seen.update((e["name"], e["iban"]) for e in new)
         entries.extend(new)
-        count = _page_count(body)
-        if count is not None and page_no + 1 >= count:
+        if total_pages is not None:
+            if page_no + 1 >= total_pages:
+                break
+        elif not raw or unpaged:
             break
+    else:
+        print(f"{prefix} ERROR: Address book exceeded 100 pages; completeness is unknown.", flush=True)
+        return None
     if not entries and first_body:
         print(f"{prefix} The address book has no entries with an IBAN that this command understands. "
               f"Fields: {json.dumps(_json_keys(first_body))[:500]}", flush=True)
@@ -3346,6 +3372,8 @@ def _fetch_addressbook(page, auth_header: str, prefix: str) -> Optional[list[dic
 def _find_contact(entries: list[dict], key: str) -> dict:
     """Pick an address book entry by a unique name/label match, or an exact IBAN."""
     q = " ".join((key or "").split()).lower()
+    if not q:
+        raise ValueError("Contact selector must contain a name, alias or IBAN")
     by_iban = [e for e in entries if e["iban"] == _normalize_iban(key)]
     exact = [e for e in entries if q in (e["name"].lower(), e["label"].lower())]
     matches = by_iban or exact or [e for e in entries if q and (q in e["name"].lower() or q in e["label"].lower())]
@@ -3358,11 +3386,17 @@ def _find_contact(entries: list[dict], key: str) -> dict:
     raise ValueError(f"{key!r} matches several contacts: {found}")
 
 
-def _george_api(page, method: str, url: str, auth_header: str, body=None) -> tuple[int, object]:
-    """Call a George API from the logged-in page, the same way George's own frontend does."""
-    result = page.evaluate("""async ([method, url, token, body]) => {
+def _george_api(page, method: str, url: str, auth_header: str, body=None,
+                *, timeout_ms: int = GEORGE_API_TIMEOUT_MS) -> tuple[int, object]:
+    """Call George with one deadline covering both fetch and consumption of the response body."""
+    timeout_ms = min(int(timeout_ms), GEORGE_API_TIMEOUT_MS)
+    if timeout_ms <= 0:
+        return 0, "Request deadline expired"
+    result = page.evaluate("""async ([method, url, token, body, timeoutMs]) => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
         try {
-            const opts = {method: method, headers: {'Authorization': token}};
+            const opts = {method: method, headers: {'Authorization': token}, signal: controller.signal};
             if (body !== null) {
                 opts.headers['Content-Type'] = 'application/json';
                 opts.body = JSON.stringify(body);
@@ -3374,8 +3408,10 @@ def _george_api(page, method: str, url: str, auth_header: str, body=None) -> tup
             return {status: resp.status, body: parsed};
         } catch (e) {
             return {status: 0, body: String((e && e.message) || e)};
+        } finally {
+            clearTimeout(timer);
         }
-    }""", [method, url, auth_header, body])
+    }""", [method, url, auth_header, body, timeout_ms])
     return int(result.get("status") or 0), result.get("body")
 
 
@@ -3514,6 +3550,8 @@ def cmd_transfer(args):
         user_id = _resolve_user_id(args)
         receiver_name = " ".join((args.to_name or "").split())
         receiver_iban = ""
+        if args.to_contact is not None and not " ".join(args.to_contact.split()):
+            raise ValueError("--to-contact must contain a name, alias or IBAN")
         if args.to_iban:
             if not receiver_name:
                 raise ValueError("--to-iban needs --to-name")
@@ -3716,8 +3754,10 @@ def cmd_transfer(args):
             order_url = f"{PAYMENTS_API_URL}/{quote(str(order_id), safe='')}"
             sign_url = f"{order_url}/sign/{quote(str(sign_id), safe='')}"
             _george_api(page, "GET", sign_url, auth)  # George's form loads the sign info first
+            deadline = time.monotonic() + args.timeout
             signature_requested = True
-            status, sign = _george_api(page, "POST", sign_url, auth, {"authorizationType": "GEORGE_TOKEN"})
+            status, sign = _george_api(page, "POST", sign_url, auth, {"authorizationType": "GEORGE_TOKEN"},
+                                     timeout_ms=int((deadline - time.monotonic()) * 1000))
             if status != 200 or not isinstance(sign, dict):
                 _print_api_error(prefix, "Starting the signature", status, sign)
                 if 400 <= status < 500 and status != 408:
@@ -3732,10 +3772,15 @@ def cmd_transfer(args):
             poll_url = poll.get("url")
             poll_state = _transfer_sign_state(sign)
             interval_ms = max(int(poll.get("interval") or 3000), 1000)
-            deadline = time.time() + args.timeout
-            while poll_url and poll_state not in SIGN_DONE_STATES | SIGN_FAILED_STATES and time.time() < deadline:
-                page.wait_for_timeout(interval_ms)
-                status, poll_body = _george_api(page, "GET", poll_url, auth)
+            while poll_url and poll_state not in SIGN_DONE_STATES | SIGN_FAILED_STATES:
+                remaining_ms = int((deadline - time.monotonic()) * 1000)
+                if remaining_ms <= 0:
+                    break
+                page.wait_for_timeout(min(interval_ms, remaining_ms))
+                remaining_ms = int((deadline - time.monotonic()) * 1000)
+                if remaining_ms <= 0:
+                    break
+                status, poll_body = _george_api(page, "GET", poll_url, auth, timeout_ms=remaining_ms)
                 state = _transfer_sign_state(poll_body) if status == 200 else None
                 if state:
                     poll_state = state
@@ -3743,7 +3788,10 @@ def cmd_transfer(args):
             # Check what George now says about the order. A finished poll can be ahead of the order,
             # so give the order a few seconds to catch up before deciding.
             for attempt in range(4):
-                status, final = _george_api(page, "GET", order_url, auth)
+                remaining_ms = int((deadline - time.monotonic()) * 1000)
+                if remaining_ms <= 0:
+                    break
+                status, final = _george_api(page, "GET", order_url, auth, timeout_ms=remaining_ms)
                 if status == 200 and isinstance(final, dict):
                     state = _extract_sign_state(final)[1]
                     sign_state = state.upper() if isinstance(state, str) else None
@@ -3754,7 +3802,10 @@ def cmd_transfer(args):
                 else:
                     _print_api_error(prefix, "Reading the order after signing", status, final)
                 if attempt < 3:
-                    page.wait_for_timeout(2000)
+                    remaining_ms = int((deadline - time.monotonic()) * 1000)
+                    if remaining_ms <= 0:
+                        break
+                    page.wait_for_timeout(min(2000, remaining_ms))
 
             return _transfer_sign_result(prefix, order_id, sign_state, poll_state)
         except (Exception, KeyboardInterrupt):
